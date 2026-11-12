@@ -1,0 +1,2010 @@
+GESTOR DE ORIENTACIÓN — EXPLICACIÓN DEL CÓDIGO PYTHON, LÍNEA POR LÍNEA
+==========================================================================
+
+Este documento explica los dos archivos de Python del proyecto:
+
+  gestor.py  El "motor": conexión a MongoDB, importar/exportar, filtros, PDF y macros de consola.
+  app.py     La interfaz web (Flask): inicio de sesión, rutas que usa la página y descargas.
+             Reutiliza las funciones de gestor.py.
+
+(La página index.html y login.html están escritas en HTML/CSS/JavaScript, no en Python;
+aquí solo se explica el Python.)
+
+CÓMO LEER ESTE DOCUMENTO
+Cada bloque muestra el código original con su número de línea ("  40 | ...") y debajo,
+después de "»", lo que hace. Las líneas muy parecidas o que forman una sola instrucción
+(listas largas, paréntesis que continúan) se explican juntas.
+
+CONCEPTOS BÁSICOS
+  Módulo / import ... Archivo de Python que se "trae" para usar sus funciones.
+  Función (def) ...... Bloque de instrucciones con nombre; se ejecuta cuando se la llama.
+  Variable ........... Un nombre que guarda un valor (ESCUELA = "...").
+  Lista [ ] .......... Valores en orden: ["a", "b"].
+  Diccionario { } .... Pares clave: valor: {"nombre": "Ana"}. Un registro de MongoDB es un diccionario.
+  f-string ........... Texto con f"...{variable}..." donde lo que está entre llaves se sustituye.
+  Decorador (@) ...... Etiqueta sobre una función que le agrega un comportamiento (@macro, @app.get).
+  try / except ....... "Intenta esto; si falla, haz lo otro" (evita que el programa se cierre).
+  MongoDB ............ Base de datos de documentos. "Colección" ~ hoja (alumnos, canalizaciones).
+  Índice ............. Atajo para encontrar datos rápido sin leer toda la colección.
+  Upsert ............. Actualizar si existe, crear si no. Por eso reimportar no duplica.
+  Bulk ............... Enviar muchas operaciones juntas: mucho más rápido que una por una.
+  JSON ............... Formato de texto para intercambiar datos: {"alumnos": [...]}.
+  Hash ............... Huella irreversible de una contraseña: nunca se guarda la contraseña real.
+  Sesión / cookie .... Marca en el navegador que recuerda que ya iniciaste sesión.
+  Ruta (@app.get) .... Dirección web a la que la página pide o envía datos (/api/alumno/123).
+
+CÓMO SE CONECTA TODO
+  1. Arranque: app.py llama a conectar() (gestor.py), que lee la configuración del archivo .env,
+     abre MongoDB, hace un "ping" y crea los índices. Si falla, muestra un mensaje claro y no arranca.
+  2. Durante el uso: la página consulta /api/estado cada 20 segundos (punto verde/rojo). Si MongoDB se
+     cae a mitad de trabajo, las rutas responden 503 con un aviso, y se reconecta sola al volver.
+  3. Registrar: al escribir el número de control, la página pide /api/autocompletar (búsqueda por
+     prefijo con índice); al elegir uno, /api/alumno/<control> llena el formulario.
+  4. Importar: archivo .xls/.xlsx/.json → leer_archivo() limpia y normaliza → carga masiva con upsert.
+  5. Exportar: datos_exportables() → exportar_xlsx() o exportar_json() → descarga.
+  6. PDF: generar_pdf() dibuja la plantilla con reportlab, una hoja por canalización.
+  7. Seguridad: before_request exige sesión; solo_admin protege importar/exportar; las contraseñas
+     se guardan como hash; 5 fallos bloquean la IP 5 minutos.
+
+CONECTIVIDAD (resumen de dónde se configura cada cosa; ver .env.example)
+  MONGO_URI ... dónde está MongoDB (local, otra computadora de la red o Atlas).
+  MONGO_DB .... nombre de la base.
+  HOST / PORT . quién puede abrir la página (127.0.0.1 = solo esta PC; 0.0.0.0 = toda la red).
+  Macro "conexion" (python gestor.py conexion) y el indicador de la página sirven para diagnosticar.
+
+==========================================================================
+ARCHIVO 1: gestor.py (579 líneas)
+==========================================================================
+
+   1 | #!/usr/bin/env python3
+     » EXPLICACIÓN: Línea "shebang": en Linux/Mac dice con qué programa se ejecuta el archivo. En
+       Windows se ignora.
+
+   2 | """
+   3 | Gestor de base de datos - Departamento de Orientación
+   4 | Python + MongoDB.  Todo funciona mediante "macros" (comandos cortos).
+   5 | 
+   6 | Uso interactivo:   python gestor.py
+   7 | Uso directo:       python gestor.py importar alumnos.xls
+   8 | Encadenar macros:  python gestor.py "importar alumnos.xls; filtrar semestre=4; lote semestre=4"
+   9 | """
+     » EXPLICACIÓN: Docstring del módulo (líneas 2-9): texto entre triples comillas que describe
+       el archivo y muestra las tres formas de usarlo (interactivo, directo y encadenando macros
+       con ";"). Python no lo ejecuta, solo sirve de documentación.
+
+  10 | import json
+     » EXPLICACIÓN: Trae el módulo estándar "json": convierte entre diccionarios de Python y texto
+       JSON.
+
+  11 | import os
+     » EXPLICACIÓN: Módulo "os": lee variables de entorno (como MONGO_URI) con os.getenv.
+
+  12 | import re
+     » EXPLICACIÓN: Módulo "re": expresiones regulares, para buscar y reemplazar patrones de
+       texto.
+
+  13 | import shlex
+     » EXPLICACIÓN: Módulo "shlex": separa una línea de comandos respetando comillas (para los
+       macros).
+
+  14 | import sys
+     » EXPLICACIÓN: Módulo "sys": acceso a los argumentos de la consola (sys.argv) y a sys.exit
+       para cerrar el programa.
+
+  15 | import time
+     » EXPLICACIÓN: Módulo "time": mide cuánto tarda el ping a la base de datos.
+
+  16 | import unicodedata
+     » EXPLICACIÓN: Módulo "unicodedata": ayuda a quitar acentos de los nombres de columna.
+
+  17 | from datetime import date
+     » EXPLICACIÓN: Importa solo la clase "date" para obtener la fecha de hoy.
+
+  18 | from pathlib import Path
+     » EXPLICACIÓN: Clase "Path": maneja rutas de archivos y carpetas igual en Windows, Mac y
+       Linux.
+
+  20 | import pandas as pd
+     » EXPLICACIÓN: pandas (alias "pd"): lee y escribe hojas de cálculo y trabaja con tablas.
+
+  21 | from pymongo.errors import PyMongoError
+     » EXPLICACIÓN: Clase base de todos los errores de MongoDB; permite capturarlos en un solo
+       "except".
+
+  22 | from pymongo import ASCENDING, DESCENDING, MongoClient, UpdateOne
+     » EXPLICACIÓN: Del conector de MongoDB: orden ascendente/descendente (ASCENDING, DESCENDING),
+       el cliente (MongoClient) y UpdateOne, una operación de actualización para cargas masivas.
+
+  23 | from reportlab.lib import colors
+     » EXPLICACIÓN: reportlab es la librería que dibuja los PDF. "colors" trae colores
+       predefinidos (gris, blanco...).
+
+  24 | from reportlab.lib.pagesizes import letter
+     » EXPLICACIÓN: Tamaño de hoja carta.
+
+  25 | from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+     » EXPLICACIÓN: Estilos de texto: uno base (getSampleStyleSheet) y la clase para crear los
+       propios (ParagraphStyle).
+
+  26 | from reportlab.lib.units import cm
+     » EXPLICACIÓN: La unidad "cm" para medir márgenes y anchos (2 * cm = 2 centímetros).
+
+  27 | from reportlab.platypus import (PageBreak, Paragraph, SimpleDocTemplate,
+  28 |                                 Spacer, Table, TableStyle)
+     » EXPLICACIÓN: Elementos de documento: salto de página, párrafo, el documento mismo, espacio
+       en blanco, tabla y estilo de tabla. (Continúa en la línea siguiente por el paréntesis.)
+
+  30 | try:  # autocompletado en consola (opcional pero recomendado)
+     » EXPLICACIÓN: Inicia un bloque "try": intenta lo de adentro y, si falla, salta al "except".
+
+  31 |     from prompt_toolkit import prompt as pt_prompt
+     » EXPLICACIÓN: Intenta importar "prompt", la función que muestra una entrada de texto con
+       autocompletado. Se guarda como pt_prompt.
+
+  32 |     from prompt_toolkit.completion import Completer, Completion
+     » EXPLICACIÓN: Importa Completer (clase base para sugerencias) y Completion (una sugerencia).
+
+  33 | except ImportError:  # el programa sigue funcionando sin autocompletado visual
+     » EXPLICACIÓN: Si prompt_toolkit no está instalado, no se detiene el programa: entra aquí.
+
+  34 |     pt_prompt = None
+     » EXPLICACIÓN: Marca que no hay autocompletado visual (el resto del código pregunta "if
+       pt_prompt:").
+
+  35 |     Completer = object
+  36 | 
+  37 | # --------------------------------------------------------------------------
+  38 | # CONFIGURACIÓN  (se lee del archivo .env si existe; ver .env.example)
+  39 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: Pone "object" como clase base de reemplazo para que la clase ControlCompleter
+       se pueda definir igual.
+
+  40 | def cargar_env(ruta=".env"):
+     » EXPLICACIÓN: Define la función que lee el archivo ".env" (configuración). Recibe la ruta;
+       por omisión ".env".
+
+  41 |     p = Path(ruta)
+     » EXPLICACIÓN: Convierte el texto de la ruta en un objeto Path.
+
+  42 |     if p.exists():
+     » EXPLICACIÓN: Solo continúa si el archivo existe; si no hay .env se usan valores por
+       omisión.
+
+  43 |         for linea in p.read_text(encoding="utf-8").splitlines():
+     » EXPLICACIÓN: Lee todo el archivo y recorre línea por línea.
+
+  44 |             linea = linea.strip()
+     » EXPLICACIÓN: Quita espacios y saltos de línea de los extremos.
+
+  45 |             if linea and not linea.startswith("#") and "=" in linea:
+     » EXPLICACIÓN: Procesa solo líneas que no estén vacías, no sean comentarios (#) y contengan
+       "=".
+
+  46 |                 k, v = linea.split("=", 1)
+     » EXPLICACIÓN: Parte la línea en el primer "=": k es el nombre (MONGO_URI), v el valor.
+
+  47 |                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+     » EXPLICACIÓN: Guarda la variable de entorno sin pisar una que ya exista (así, una variable
+       puesta en la consola gana sobre el .env). strip() quita espacios y comillas.
+
+  50 | cargar_env()
+     » EXPLICACIÓN: Ejecuta la función: desde aquí las variables del .env ya están disponibles.
+
+  51 | MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+     » EXPLICACIÓN: Dirección de MongoDB. os.getenv(nombre, valor_por_omision): usa la variable o,
+       si no existe, mongodb://localhost:27017 (esta computadora).
+
+  52 | DB_NAME = os.getenv("MONGO_DB", "orientacion")
+     » EXPLICACIÓN: Nombre de la base de datos dentro de MongoDB (por omisión "orientacion").
+
+  53 | ESCUELA = os.getenv("ESCUELA", "NOMBRE DE LA ESCUELA")
+     » EXPLICACIÓN: Nombre de la escuela que sale en el encabezado de los PDF.
+
+  54 | DIR_JSON = Path("datos_json")
+     » EXPLICACIÓN: Carpeta donde se guardan los JSON convertidos desde Excel.
+
+  55 | DIR_PDF = Path("reportes")
+     » EXPLICACIÓN: Carpeta donde se guardan los PDF.
+
+  56 | MONGO_TIMEOUT_MS = int(os.getenv("MONGO_TIMEOUT_MS", "4000"))
+     » EXPLICACIÓN: Milisegundos que se espera a que MongoDB responda antes de declarar "sin
+       conexión" (4000 = 4 segundos). Se cambia en el .env si la red es lenta.
+
+  57 | DIR_EXP = Path("exportaciones")
+  58 | 
+  59 | # Datos que pertenecen al alumno (se autocompletan con el número de control)
+     » EXPLICACIÓN: Carpeta donde el macro "exportar" guarda los archivos.
+
+  60 | CAMPOS_ALUMNO = [
+  61 |     "numero_control", "apellido_paterno", "apellido_materno", "nombre",
+  62 |     "generacion", "especialidad", "semestre", "grupo", "grado", "turno",
+  63 |     "nombre_padre_madre", "telefono",
+  64 | ]
+  65 | # Datos propios de cada canalización
+     » EXPLICACIÓN: Lista (en orden) de los datos que pertenecen al alumno y se autocompletan con
+       el número de control. Los textos son los nombres de campo en MongoDB.
+
+  66 | CAMPOS_CANALIZACION = [
+  67 |     "fecha_atencion", "persona_reporta", "motivo",
+  68 |     "medida_modificacion_conducta", "seguimiento_documentos",
+  69 | ]
+     » EXPLICACIÓN: Lista de los datos propios de cada canalización (fecha, quién reporta, motivo,
+       medida y seguimiento). Junto con la anterior y "canalizaciones_anteriores" forman los 17
+       rubros.
+
+  70 | ETIQUETAS = {
+  71 |     "fecha_atencion": "Fecha de atención",
+  72 |     "numero_control": "Número de control",
+  73 |     "apellido_paterno": "Apellido paterno",
+  74 |     "apellido_materno": "Apellido materno",
+  75 |     "nombre": "Nombre(s)",
+  76 |     "generacion": "Generación",
+  77 |     "especialidad": "Especialidad",
+  78 |     "semestre": "Semestre",
+  79 |     "grupo": "Grupo",
+  80 |     "grado": "Grado",
+  81 |     "turno": "Turno",
+  82 |     "persona_reporta": "Persona que reporta",
+  83 |     "motivo": "Motivo",
+  84 |     "nombre_padre_madre": "Nombre de padre o madre",
+  85 |     "telefono": "Teléfono",
+  86 |     "medida_modificacion_conducta": "Medida de modificación de conducta",
+  87 |     "seguimiento_documentos": "Seguimiento de los documentos",
+  88 |     "canalizaciones_anteriores": "Número de canalizaciones anteriores",
+  89 | }
+  90 | 
+  91 | # Nombres alternativos de columnas que pueden venir en el Excel
+     » EXPLICACIÓN: Diccionario (clave: valor) que traduce cada nombre interno de campo a su texto
+       legible. Se usa en el PDF, los encabezados del Excel exportado y las preguntas de la
+       consola.
+
+  92 | ALIAS = {
+  93 |     "numero_control": ["numero_de_control", "no_control", "n_control", "control", "matricula", "num_control"],
+  94 |     "fecha_atencion": ["fecha_de_atencion", "fecha"],
+  95 |     "persona_reporta": ["persona_que_reporta", "reporta", "quien_reporta"],
+  96 |     "nombre_padre_madre": ["nombre_de_padre_o_madre", "padre_o_madre", "nombre_padre_o_madre", "tutor"],
+  97 |     "medida_modificacion_conducta": ["medida_de_modificacion_de_conducta", "medida"],
+  98 |     "seguimiento_documentos": ["seguimiento_de_los_documentos", "seguimiento"],
+  99 |     "generacion": ["generación"],
+ 100 |     "nombre": ["nombre_s", "nombres"],
+ 101 | }
+ 102 | 
+ 103 | 
+ 104 | # --------------------------------------------------------------------------
+ 105 | # UTILIDADES
+ 106 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: Diccionario de nombres alternativos de columnas. Si tu Excel dice "Matrícula"
+       o "No. control", el programa sabe que es "numero_control". Así no importa cómo escriba cada
+       persona el encabezado.
+
+ 107 | def quitar_acentos(txt: str) -> str:
+     » EXPLICACIÓN: Función que recibe un texto y devuelve el mismo sin acentos.
+
+ 108 |     return "".join(c for c in unicodedata.normalize("NFD", txt) if unicodedata.category(c) != "Mn")
+     » EXPLICACIÓN: normalize("NFD") separa cada letra de su acento; se descartan los caracteres
+       de categoría "Mn" (marcas de acento) y se vuelve a unir. "Teléfono" → "Telefono".
+
+ 111 | def normalizar_columna(col: str) -> str:
+     » EXPLICACIÓN: Convierte cualquier encabezado de Excel en el nombre interno estándar.
+
+ 112 |     c = quitar_acentos(str(col)).lower().strip()
+     » EXPLICACIÓN: Convierte a texto, quita acentos, pasa a minúsculas y quita espacios
+       sobrantes.
+
+ 113 |     c = re.sub(r"[^a-z0-9]+", "_", c).strip("_")
+     » EXPLICACIÓN: Reemplaza todo lo que no sea letra o número por "_" y quita guiones bajos de
+       los extremos: "Número de control" → "numero_de_control".
+
+ 114 |     for oficial, alternativos in ALIAS.items():
+     » EXPLICACIÓN: Recorre el diccionario ALIAS: "oficial" es el nombre estándar y "alternativos"
+       su lista de variantes.
+
+ 115 |         if c == oficial or c in [quitar_acentos(a) for a in alternativos]:
+     » EXPLICACIÓN: Si el encabezado ya es el oficial o coincide con alguna variante (también sin
+       acentos)...
+
+ 116 |             return oficial
+     » EXPLICACIÓN: ...devuelve el nombre oficial.
+
+ 117 |     return c
+     » EXPLICACIÓN: Si no coincide con nada, devuelve el nombre limpio tal cual (columna extra que
+       luego se ignora).
+
+ 120 | def limpiar(valor) -> str:
+     » EXPLICACIÓN: Convierte cualquier valor de una celda en texto limpio.
+
+ 121 |     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+     » EXPLICACIÓN: Si la celda está vacía (None) o es un número vacío (NaN de pandas)...
+
+ 122 |         return ""
+     » EXPLICACIÓN: ...devuelve texto vacío.
+
+ 123 |     v = str(valor).strip()
+     » EXPLICACIÓN: Convierte a texto y quita espacios de los extremos.
+
+ 124 |     return "" if v.lower() in ("nan", "nat", "none") else v
+     » EXPLICACIÓN: Si el texto es "nan", "nat" o "none" (así representa pandas los vacíos)
+       devuelve vacío; si no, el valor.
+
+ 127 | def a_fecha_iso(valor) -> str:
+     » EXPLICACIÓN: Convierte una fecha en cualquier formato a "AAAA-MM-DD", que ordena bien en la
+       base de datos.
+
+ 128 |     v = limpiar(valor)
+     » EXPLICACIÓN: Limpia el valor primero.
+
+ 129 |     if not v:
+     » EXPLICACIÓN: Si quedó vacío...
+
+ 130 |         return ""
+     » EXPLICACIÓN: ...devuelve vacío (no hay fecha).
+
+ 131 |     if re.match(r"^\d{4}-\d{2}-\d{2}", v):  # ya viene en formato ISO (así lo entrega Excel)
+     » EXPLICACIÓN: Si el texto ya empieza como 2025-03-10 (así entrega Excel las fechas)...
+
+ 132 |         return v[:10]
+     » EXPLICACIÓN: ...se queda con los primeros 10 caracteres (descarta la hora "00:00:00").
+
+ 133 |     f = pd.to_datetime(v, dayfirst=True, errors="coerce")  # texto tipo 10/03/2025 = día/mes/año
+     » EXPLICACIÓN: Si no, intenta interpretar el texto; dayfirst=True lo lee como día/mes/año
+       (10/03/2025 = 10 de marzo). errors="coerce" devuelve "vacío" en vez de fallar.
+
+ 134 |     return f.strftime("%Y-%m-%d") if not pd.isna(f) else v
+     » EXPLICACIÓN: Si se entendió, la devuelve como AAAA-MM-DD; si no, devuelve el texto
+       original.
+
+ 137 | def uri_oculta(uri: str) -> str:
+     » EXPLICACIÓN: Función que esconde la contraseña de una dirección de conexión.
+
+ 138 |     """Esconde la contraseña de la URI para mostrarla en pantalla."""
+     » EXPLICACIÓN: Descripción de la función.
+
+ 139 |     return re.sub(r"://([^:/@]+):[^@]+@", r"://\1:****@", uri)
+     » EXPLICACIÓN: Busca "://usuario:contraseña@" y reemplaza la contraseña por ****, para poder
+       mostrar la dirección en pantalla sin exponerla.
+
+ 142 | def conectar():
+     » EXPLICACIÓN: Función central de conectividad: abre la conexión, la prueba y prepara la
+       base. Devuelve la base de datos.
+
+ 143 |     """Abre la conexión y comprueba que MongoDB responde; si no, explica qué revisar."""
+     » EXPLICACIÓN: Descripción: lanza ConnectionError con un mensaje claro si falla.
+
+ 144 |     if MONGO_URI == "mock":  # modo de pruebas sin servidor Mongo
+     » EXPLICACIÓN: Modo de pruebas: si la URI es "mock" no se usa un servidor real.
+
+ 145 |         import mongomock
+     » EXPLICACIÓN: Importa un MongoDB falso que vive en memoria (solo para pruebas).
+
+ 146 |         cliente = mongomock.MongoClient()
+     » EXPLICACIÓN: Crea el cliente falso.
+
+ 147 |     else:
+     » EXPLICACIÓN: En el uso normal...
+
+ 148 |         cliente = MongoClient(MONGO_URI, serverSelectionTimeoutMS=MONGO_TIMEOUT_MS,
+ 149 |                               connectTimeoutMS=MONGO_TIMEOUT_MS, maxPoolSize=20,
+ 150 |                               appname="gestor-orientacion")
+     » EXPLICACIÓN: Crea el cliente real. Opciones: espera como máximo MONGO_TIMEOUT_MS (4 s por
+       omisión) para encontrar el servidor y el mismo tiempo para conectar, mantiene hasta 20
+       conexiones abiertas reutilizables (más rápido) y se identifica como "gestor-orientacion" en
+       los registros del servidor.
+
+ 151 |     db = cliente[DB_NAME]
+     » EXPLICACIÓN: Selecciona la base de datos por su nombre. Todavía no se ha conectado nada de
+       verdad: pymongo conecta cuando hace falta.
+
+ 152 |     try:
+     » EXPLICACIÓN: Bloque protegido: aquí ocurre la primera comunicación real con el servidor.
+
+ 153 |         cliente.admin.command("ping")
+     » EXPLICACIÓN: "Ping": pregunta al servidor si está vivo. Si MongoDB está apagado o la URI es
+       incorrecta, falla aquí.
+
+ 154 |         # Índices: hacen que el autocompletado y los filtros sean casi instantáneos
+     » EXPLICACIÓN: Los índices son como el índice de un libro: permiten encontrar datos sin leer
+       toda la colección.
+
+ 155 |         db.alumnos.create_index("numero_control", unique=True)
+     » EXPLICACIÓN: Índice único por número de control: búsqueda instantánea y evita alumnos
+       duplicados. Si ya existe, no hace nada.
+
+ 156 |         db.alumnos.create_index([("apellido_paterno", ASCENDING), ("apellido_materno", ASCENDING)])
+     » EXPLICACIÓN: Índice por apellidos para buscar por nombre.
+
+ 157 |         db.canalizaciones.create_index([("numero_control", ASCENDING), ("fecha_atencion", DESCENDING)])
+     » EXPLICACIÓN: Índice para listar las canalizaciones de un alumno, de la más reciente a la
+       más antigua.
+
+ 158 |         db.canalizaciones.create_index([("generacion", ASCENDING), ("especialidad", ASCENDING),
+ 159 |                                         ("semestre", ASCENDING), ("grupo", ASCENDING), ("turno", ASCENDING)])
+     » EXPLICACIÓN: Índice combinado para los filtros más usados (generación, especialidad,
+       semestre, grupo, turno).
+
+ 160 |     except PyMongoError as e:
+     » EXPLICACIÓN: Si algo falló en el bloque (cualquier error de MongoDB)...
+
+ 161 |         raise ConnectionError(
+ 162 |             f"No se pudo conectar a MongoDB ({uri_oculta(MONGO_URI)}). Revisa que el servicio esté encendido, "
+ 163 |             f"que MONGO_URI en .env sea correcta (usuario/contraseña, host, puerto) y, si usas Atlas, que tu IP "
+ 164 |             f"esté permitida. Detalle: {type(e).__name__}") from e
+     » EXPLICACIÓN: ...lanza un error propio con instrucciones claras: qué revisar (servicio
+       encendido, MONGO_URI, IP permitida en Atlas) y el tipo técnico del fallo. La contraseña va
+       oculta. "from e" conserva el error original.
+
+ 165 |     return db
+     » EXPLICACIÓN: Devuelve la base lista para usar.
+
+ 168 | def estado_conexion(db) -> dict:
+     » EXPLICACIÓN: Prueba rápida de conexión; la usa el indicador verde/rojo de la página y el
+       macro "conexion".
+
+ 169 |     """Ping rápido; lo usa el indicador de la página y el macro 'conexion'."""
+     » EXPLICACIÓN: Descripción de la función.
+
+ 170 |     t = time.perf_counter()
+     » EXPLICACIÓN: Toma la hora con precisión para medir la demora.
+
+ 171 |     try:
+     » EXPLICACIÓN: Intenta el ping.
+
+ 172 |         db.client.admin.command("ping")
+     » EXPLICACIÓN: Envía el ping al servidor.
+
+ 173 |         return {"conectado": True, "ms": round((time.perf_counter() - t) * 1000)}
+     » EXPLICACIÓN: Si respondió, devuelve un diccionario: conectado y cuántos milisegundos tardó.
+
+ 174 |     except PyMongoError as e:
+     » EXPLICACIÓN: Si falló...
+
+ 175 |         return {"conectado": False, "error": type(e).__name__}
+ 176 | 
+ 177 | 
+ 178 | # --------------------------------------------------------------------------
+ 179 | # AUTOCOMPLETADO POR NÚMERO DE CONTROL
+ 180 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: ...devuelve conectado=False con el tipo de error. No detiene el programa.
+
+ 181 | class ControlCompleter(Completer):
+     » EXPLICACIÓN: Clase que sugiere números de control mientras se escribe (para la consola).
+
+ 182 |     """Sugiere números de control mientras se escribe (búsqueda por prefijo indexada)."""
+     » EXPLICACIÓN: Descripción: búsqueda por prefijo apoyada en el índice.
+
+ 184 |     def __init__(self, db):
+     » EXPLICACIÓN: Constructor: se ejecuta al crear el objeto y recibe la base.
+
+ 185 |         self.db = db
+     » EXPLICACIÓN: Guarda la base dentro del objeto.
+
+ 187 |     def get_completions(self, document, complete_event):
+     » EXPLICACIÓN: prompt_toolkit la llama cada vez que cambia el texto escrito, para pedir las
+       sugerencias.
+
+ 188 |         txt = document.text.strip()
+     » EXPLICACIÓN: Lo que la persona lleva escrito.
+
+ 189 |         if not txt:
+ 190 |             return
+     » EXPLICACIÓN: Si no hay nada escrito, se sale sin sugerir ("return" en la línea siguiente).
+
+ 191 |         cur = self.db.alumnos.find(
+ 192 |             {"numero_control": {"$regex": "^" + re.escape(txt)}},
+ 193 |             {"_id": 0, "numero_control": 1, "nombre": 1, "apellido_paterno": 1, "apellido_materno": 1},
+ 194 |         ).limit(10)
+     » EXPLICACIÓN: Consulta a MongoDB: números de control que EMPIECEN con lo escrito ("^" =
+       inicio; re.escape evita que símbolos se tomen como patrón). Solo trae 4 campos y como
+       máximo 10 resultados: por eso es rápido.
+
+ 195 |         for a in cur:
+     » EXPLICACIÓN: Recorre cada alumno encontrado.
+
+ 196 |             nombre = f"{a.get('apellido_paterno','')} {a.get('apellido_materno','')} {a.get('nombre','')}".strip()
+     » EXPLICACIÓN: Arma "Apellido Apellido Nombre" (f-string: el texto entre llaves se sustituye
+       por su valor).
+
+ 197 |             yield Completion(a["numero_control"], start_position=-len(txt), display_meta=nombre)
+     » EXPLICACIÓN: Entrega una sugerencia (yield = devolver uno por uno).
+       start_position=-len(txt) reemplaza lo escrito; display_meta muestra el nombre al lado.
+
+ 200 | def preguntar(msg, default="", completer=None) -> str:
+     » EXPLICACIÓN: Función que hace una pregunta en la consola. Con default muestra un valor
+       propuesto editable.
+
+ 201 |     if pt_prompt:
+     » EXPLICACIÓN: Si hay prompt_toolkit...
+
+ 202 |         return pt_prompt(f"{msg}: ", default=default, completer=completer, complete_while_typing=True).strip()
+     » EXPLICACIÓN: ...lo usa: con valor inicial (default), autocompletado y sugerencias mientras
+       se escribe.
+
+ 203 |     r = input(f"{msg}{f' [{default}]' if default else ''}: ").strip()
+     » EXPLICACIÓN: Si no, usa input() normal de Python y muestra el valor propuesto entre
+       corchetes.
+
+ 204 |     return r or default
+ 205 | 
+ 206 | 
+ 207 | # --------------------------------------------------------------------------
+ 208 | # REGISTRO DE MACROS
+ 209 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: Si no escribió nada (Enter), devuelve el valor propuesto.
+
+ 210 | MACROS = {}
+     » EXPLICACIÓN: Diccionario vacío que se llenará con todos los macros: nombre → (función,
+       ayuda).
+
+ 213 | def macro(nombre, ayuda):
+     » EXPLICACIÓN: Crea un "decorador": una etiqueta que se pone encima de una función para
+       registrarla como macro.
+
+ 214 |     def deco(fn):
+     » EXPLICACIÓN: Función interna que recibe la función a registrar.
+
+ 215 |         MACROS[nombre] = (fn, ayuda)
+     » EXPLICACIÓN: La guarda en el diccionario con su texto de ayuda.
+
+ 216 |         return fn
+     » EXPLICACIÓN: Devuelve la función sin cambios.
+
+ 217 |     return deco
+     » EXPLICACIÓN: Devuelve el decorador. Por eso cada macro empieza con @macro("nombre",
+       "ayuda").
+
+ 220 | def leer_archivo(ruta: Path):
+     » EXPLICACIÓN: Lee un archivo de datos y lo deja como lista de registros limpios. Devuelve
+       (registros, filas_omitidas).
+
+ 221 |     """Lee .xls/.xlsx (todas las hojas) o .json y devuelve (registros limpios, filas omitidas)."""
+     » EXPLICACIÓN: Descripción: acepta Excel (todas las hojas) o JSON.
+
+ 222 |     ext = ruta.suffix.lower()
+     » EXPLICACIÓN: Extensión del archivo en minúsculas (".xlsx").
+
+ 223 |     if ext in (".xls", ".xlsx"):
+     » EXPLICACIÓN: Si es hoja de cálculo...
+
+ 224 |         filas = []
+     » EXPLICACIÓN: Lista donde se juntarán todas las filas.
+
+ 225 |         for hoja in pd.read_excel(ruta, dtype=str, sheet_name=None).values():
+     » EXPLICACIÓN: sheet_name=None lee TODAS las hojas (así se reimporta un archivo exportado con
+       hojas "Alumnos" y "Canalizaciones"). dtype=str lee todo como texto para no perder ceros a
+       la izquierda en controles y teléfonos.
+
+ 226 |             filas += hoja.to_dict("records")
+     » EXPLICACIÓN: Convierte cada hoja en lista de diccionarios (una fila = un diccionario) y las
+       acumula.
+
+ 227 |     elif ext == ".json":
+     » EXPLICACIÓN: Si es JSON...
+
+ 228 |         datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
+     » EXPLICACIÓN: Lee el archivo como texto (utf-8-sig tolera la marca que a veces agrega el
+       Bloc de notas) y lo convierte en datos de Python.
+
+ 229 |         filas = datos if isinstance(datos, list) else datos.get("alumnos", []) + datos.get("canalizaciones", [])
+     » EXPLICACIÓN: Si el JSON es una lista simple, la usa. Si es el paquete exportado por el
+       sistema ({"alumnos": [...], "canalizaciones": [...]}), une las dos listas.
+
+ 230 |     else:
+     » EXPLICACIÓN: Cualquier otra extensión...
+
+ 231 |         raise ValueError("Formato no admitido: usa .xls, .xlsx o .json")
+     » EXPLICACIÓN: ...lanza un error explicando los formatos aceptados.
+
+ 232 |     registros = []
+     » EXPLICACIÓN: Lista de salida.
+
+ 233 |     for fila in filas:
+     » EXPLICACIÓN: Procesa fila por fila.
+
+ 234 |         r = {normalizar_columna(k): limpiar(v) for k, v in fila.items()}
+     » EXPLICACIÓN: Crea un diccionario nuevo con nombres de campo estándar y valores limpios
+       (comprensión de diccionario).
+
+ 235 |         if r.get("numero_control"):
+     » EXPLICACIÓN: Solo se aceptan filas que traigan número de control: es la llave de todo.
+
+ 236 |             r["fecha_atencion"] = a_fecha_iso(r.get("fecha_atencion"))
+     » EXPLICACIÓN: Normaliza la fecha a AAAA-MM-DD.
+
+ 237 |             registros.append(r)
+     » EXPLICACIÓN: Agrega el registro a la lista.
+
+ 238 |     return registros, len(filas) - len(registros)
+     » EXPLICACIÓN: Devuelve los registros y cuántas filas se descartaron (total − aceptadas).
+
+ 241 | @macro("importar", "importar <archivo.xls|.xlsx|.json>  → carga la hoja o el JSON en MongoDB")
+     » EXPLICACIÓN: Registra el macro "importar" con su ayuda.
+
+ 242 | def importar(db, args):
+     » EXPLICACIÓN: Macro que carga un archivo a MongoDB. db es la base y args los argumentos
+       escritos después del nombre.
+
+ 243 |     if not args:
+ 244 |         print("Uso: importar <archivo.xls|.xlsx|.json>")
+ 245 |         return
+     » EXPLICACIÓN: Si no se indicó archivo, muestra cómo se usa y termina (print + return en las
+       líneas siguientes).
+
+ 246 |     ruta = Path(args[0])
+     » EXPLICACIÓN: Primer argumento = ruta del archivo.
+
+ 247 |     if not ruta.exists():
+ 248 |         print(f"No existe el archivo: {ruta}")
+ 249 |         return
+     » EXPLICACIÓN: Si no existe, avisa y termina.
+
+ 250 |     try:
+     » EXPLICACIÓN: Intenta leer el archivo.
+
+ 251 |         registros, omitidas = leer_archivo(ruta)
+     » EXPLICACIÓN: Llama a la función anterior.
+
+ 252 |     except Exception as e:
+     » EXPLICACIÓN: Si el archivo está dañado o el formato no es válido...
+
+ 253 |         print(f"No se pudo leer el archivo: {e}")
+ 254 |         return
+     » EXPLICACIÓN: ...muestra el motivo y termina (return). En la web, este texto aparece en
+       pantalla.
+
+ 255 |     if not registros:
+ 256 |         print("No se encontraron filas con número de control.")
+ 257 |         return
+     » EXPLICACIÓN: Si no había filas útiles, avisa y termina.
+
+ 258 |     texto_json = ""
+     » EXPLICACIÓN: Texto que se añadirá al mensaje final.
+
+ 259 |     if ruta.suffix.lower() != ".json":  # de Excel se guarda además una copia JSON
+     » EXPLICACIÓN: Solo si el origen NO es JSON, se guarda además una copia JSON.
+
+ 260 |         DIR_JSON.mkdir(exist_ok=True)
+     » EXPLICACIÓN: Crea la carpeta datos_json si no existe (exist_ok=True: sin error si ya
+       existe).
+
+ 261 |         ruta_json = DIR_JSON / (ruta.stem + ".json")
+     » EXPLICACIÓN: Arma el nombre: mismo nombre del Excel con extensión .json.
+
+ 262 |         ruta_json.write_text(json.dumps(registros, ensure_ascii=False, indent=2), encoding="utf-8")
+     » EXPLICACIÓN: Escribe el JSON. ensure_ascii=False conserva acentos y ñ; indent=2 lo deja
+       legible.
+
+ 263 |         texto_json = f" | JSON: {ruta_json}"
+     » EXPLICACIÓN: Guarda el aviso con la ruta del JSON.
+
+ 265 |     # Carga masiva: una sola ida al servidor, tiempo de carga mínimo
+     » EXPLICACIÓN: Carga masiva: se arma una lista de operaciones y se envía junta (una sola ida
+       al servidor en vez de miles).
+
+ 266 |     ops_alumnos, ops_can, controles = [], [], set()
+     » EXPLICACIÓN: Dos listas de operaciones y un conjunto (set) con los controles tocados, sin
+       repetir.
+
+ 267 |     for r in registros:
+     » EXPLICACIÓN: Para cada registro...
+
+ 268 |         alumno = {k: r[k] for k in CAMPOS_ALUMNO if k in r}
+     » EXPLICACIÓN: Arma los datos del alumno SOLO con campos que traen valor: así importar un
+       archivo sin teléfono no borra el teléfono ya guardado.
+
+ 269 |         ops_alumnos.append(UpdateOne({"numero_control": alumno["numero_control"]},
+ 270 |                                      {"$set": alumno}, upsert=True))
+     » EXPLICACIÓN: Operación "upsert": busca al alumno por número de control; si existe lo
+       actualiza ($set) y si no, lo crea. Nunca duplica.
+
+ 271 |         if r.get("fecha_atencion") or r.get("motivo"):
+     » EXPLICACIÓN: Si la fila trae fecha o motivo, es una canalización y no solo un alumno.
+
+ 272 |             can = {k: r.get(k, "") for k in CAMPOS_ALUMNO + CAMPOS_CANALIZACION}
+     » EXPLICACIÓN: Arma el documento de la canalización con todos los datos del alumno copiados
+       (así los filtros y PDF no necesitan cruzar colecciones) más los datos de atención.
+
+ 273 |             clave = {"numero_control": can["numero_control"],
+ 274 |                      "fecha_atencion": can["fecha_atencion"], "motivo": can["motivo"]}
+     » EXPLICACIÓN: Identificador de una canalización: alumno + fecha + motivo.
+
+ 275 |             ops_can.append(UpdateOne(clave, {"$set": can}, upsert=True))  # reimportar no duplica
+     » EXPLICACIÓN: Upsert con esa clave: reimportar el mismo archivo no duplica canalizaciones.
+
+ 276 |             controles.add(can["numero_control"])
+     » EXPLICACIÓN: Anota el alumno para recalcular después sus canalizaciones anteriores.
+
+ 277 |     db.alumnos.bulk_write(ops_alumnos, ordered=False)
+     » EXPLICACIÓN: Envía todas las operaciones de alumnos de una vez. ordered=False: no se
+       detiene si una falla y puede paralelizar.
+
+ 278 |     if ops_can:
+     » EXPLICACIÓN: Si hubo canalizaciones...
+
+ 279 |         db.canalizaciones.bulk_write(ops_can, ordered=False)
+     » EXPLICACIÓN: ...las envía también en bloque.
+
+ 280 |         recalcular_anteriores(db, controles)
+     » EXPLICACIÓN: Recalcula el contador "canalizaciones anteriores".
+
+ 281 |     print(f"✔ {len(registros)} filas cargadas, {omitidas} omitidas{texto_json} | "
+ 282 |           f"alumnos: {len(ops_alumnos)} | canalizaciones: {len(ops_can)}")
+     » EXPLICACIÓN: Resumen final: filas cargadas, omitidas, JSON generado y totales.
+
+ 285 | def datos_exportables(db, filtro=None):
+     » EXPLICACIÓN: Obtiene los datos a exportar.
+
+ 286 |     """Alumnos y canalizaciones a exportar; con filtro, solo los alumnos de esas canalizaciones."""
+     » EXPLICACIÓN: Descripción: con filtro, solo los alumnos de esas canalizaciones.
+
+ 287 |     filtro = filtro or {}
+     » EXPLICACIÓN: Si no hay filtro, usa uno vacío (= todo).
+
+ 288 |     can = list(db.canalizaciones.find(filtro, {"_id": 0}).sort(
+ 289 |         [("apellido_paterno", ASCENDING), ("fecha_atencion", ASCENDING)]))
+     » EXPLICACIÓN: Trae las canalizaciones; {"_id": 0} oculta el identificador interno de Mongo;
+       ordenadas por apellido y fecha.
+
+ 290 |     if filtro:
+     » EXPLICACIÓN: Si hay filtro...
+
+ 291 |         controles = list({c["numero_control"] for c in can})
+     » EXPLICACIÓN: Saca los números de control de las canalizaciones encontradas, sin repetir.
+
+ 292 |         alu = list(db.alumnos.find({"numero_control": {"$in": controles}}, {"_id": 0}).sort("apellido_paterno", ASCENDING))
+     » EXPLICACIÓN: ...y trae solo esos alumnos ($in = "está dentro de esta lista").
+
+ 293 |     else:
+     » EXPLICACIÓN: Sin filtro...
+
+ 294 |         alu = list(db.alumnos.find({}, {"_id": 0}).sort("apellido_paterno", ASCENDING))
+     » EXPLICACIÓN: ...trae todos los alumnos.
+
+ 295 |     return alu, can
+     » EXPLICACIÓN: Devuelve ambas listas.
+
+ 298 | def exportar_json(db, filtro=None) -> bytes:
+ 299 |     """JSON con alumnos y canalizaciones; devuelve bytes (sirve para consola y web)."""
+     » EXPLICACIÓN: Genera el JSON de exportación y devuelve los bytes (no escribe archivo: sirve
+       para consola y web).
+
+ 300 |     alu, can = datos_exportables(db, filtro)
+     » EXPLICACIÓN: Obtiene los datos.
+
+ 301 |     paquete = {"exportado": date.today().isoformat(), "alumnos": alu, "canalizaciones": can}
+     » EXPLICACIÓN: Diccionario con la fecha de exportación y las dos listas.
+
+ 302 |     return json.dumps(paquete, ensure_ascii=False, indent=2).encode("utf-8")
+     » EXPLICACIÓN: Lo convierte a texto JSON (acentos conservados, sangría legible) y lo codifica
+       en UTF-8.
+
+ 305 | def exportar_xlsx(db, filtro=None) -> bytes:
+     » EXPLICACIÓN: Genera el libro de Excel y devuelve sus bytes.
+
+ 306 |     """Libro de Excel con hojas 'Alumnos' y 'Canalizaciones'; se puede volver a importar."""
+     » EXPLICACIÓN: Descripción: hojas "Alumnos" y "Canalizaciones"; se puede reimportar.
+
+ 307 |     from io import BytesIO
+     » EXPLICACIÓN: BytesIO: un "archivo en memoria" para no escribir en disco.
+
+ 308 |     from openpyxl.styles import Font, PatternFill
+     » EXPLICACIÓN: Estilos de celda de Excel (relleno y letra).
+
+ 309 |     alu, can = datos_exportables(db, filtro)
+     » EXPLICACIÓN: Obtiene los datos.
+
+ 310 |     cols_can = ["fecha_atencion"] + CAMPOS_ALUMNO + CAMPOS_CANALIZACION[1:] + ["canalizaciones_anteriores"]
+     » EXPLICACIÓN: Orden de columnas de la hoja Canalizaciones: fecha, datos del alumno, datos de
+       atención y contador.
+
+ 311 |     salida = BytesIO()
+     » EXPLICACIÓN: Archivo en memoria donde se escribe el Excel.
+
+ 312 |     with pd.ExcelWriter(salida, engine="openpyxl") as w:
+     » EXPLICACIÓN: Abre el escritor de Excel; al salir del bloque "with" se cierra y guarda solo.
+
+ 313 |         for hoja, filas, cols in (("Alumnos", alu, CAMPOS_ALUMNO), ("Canalizaciones", can, cols_can)):
+     » EXPLICACIÓN: Repite lo mismo para las dos hojas: (nombre, datos, columnas).
+
+ 314 |             df = pd.DataFrame(filas, columns=cols).rename(columns=ETIQUETAS)
+     » EXPLICACIÓN: Crea una tabla con las columnas indicadas y renombra los encabezados con
+       ETIQUETAS ("fecha_atencion" → "Fecha de atención").
+
+ 315 |             df.to_excel(w, sheet_name=hoja, index=False)
+     » EXPLICACIÓN: Escribe la tabla en la hoja (index=False: sin columna de números de fila).
+
+ 316 |             ws = w.sheets[hoja]
+     » EXPLICACIÓN: Toma la hoja recién creada para darle formato.
+
+ 317 |             ws.freeze_panes = "A2"
+     » EXPLICACIÓN: Congela la fila de encabezados para que no se pierda al bajar.
+
+ 318 |             for celda in ws[1]:
+     » EXPLICACIÓN: Recorre las celdas de la fila 1 (encabezados).
+
+ 319 |                 celda.fill = PatternFill("solid", fgColor="7A1F3D")
+     » EXPLICACIÓN: Fondo borgoña (7A1F3D).
+
+ 320 |                 celda.font = Font(bold=True, color="FFFFFF")
+     » EXPLICACIÓN: Letra blanca en negritas.
+
+ 321 |             for n, col in enumerate(df.columns, start=1):
+     » EXPLICACIÓN: Para cada columna (n = posición desde 1)...
+
+ 322 |                 largo = max([len(str(col))] + [len(str(v)) for v in df[col].head(200)])
+     » EXPLICACIÓN: Calcula el texto más largo entre el encabezado y las primeras 200 filas.
+
+ 323 |                 ws.column_dimensions[ws.cell(1, n).column_letter].width = min(largo + 2, 45)
+     » EXPLICACIÓN: Ajusta el ancho de la columna (máximo 45) para que se lea bien.
+
+ 324 |             for fila in ws.iter_rows(min_row=2):
+     » EXPLICACIÓN: Recorre las filas de datos (de la 2 en adelante). Es una medida de seguridad:
+       si alguien captura un texto que empieza con "=" (por ejemplo "=1+1"), Excel lo trataría
+       como una fórmula.
+
+ 325 |                 for celda in fila:
+     » EXPLICACIÓN: Recorre cada celda de la fila.
+
+ 326 |                     if isinstance(celda.value, str):
+     » EXPLICACIÓN: Si el contenido es texto...
+
+ 327 |                         celda.data_type = "s"  # texto literal: un "=..." capturado nunca se ejecuta como fórmula
+     » EXPLICACIÓN: ...se marca como texto literal ("s" = string), así Excel lo muestra tal cual y
+       nunca lo ejecuta como fórmula.
+
+ 328 |     return salida.getvalue()
+     » EXPLICACIÓN: Devuelve el contenido del Excel como bytes.
+
+ 331 | @macro("exportar", "exportar xlsx|json [campo=valor ...]  → archivo en exportaciones/ (se puede reimportar)")
+     » EXPLICACIÓN: Registra el macro "exportar".
+
+ 332 | def exportar(db, args):
+     » EXPLICACIÓN: Macro: exportar xlsx|json con filtros opcionales.
+
+ 333 |     if not args or args[0].lower() not in ("xlsx", "json"):
+ 334 |         print("Uso: exportar xlsx|json [campo=valor ...]")
+ 335 |         return
+     » EXPLICACIÓN: Si falta el formato o no es válido, muestra el uso y termina.
+
+ 336 |     formato = args[0].lower()
+     » EXPLICACIÓN: Formato elegido.
+
+ 337 |     filtro = construir_filtro(args[1:])
+     » EXPLICACIÓN: El resto de argumentos (semestre=4...) se convierten en filtro.
+
+ 338 |     datos = exportar_xlsx(db, filtro) if formato == "xlsx" else exportar_json(db, filtro)
+     » EXPLICACIÓN: Genera el Excel o el JSON según el formato.
+
+ 339 |     DIR_EXP.mkdir(exist_ok=True)
+     » EXPLICACIÓN: Crea la carpeta exportaciones.
+
+ 340 |     ruta = DIR_EXP / f"orientacion_{date.today().isoformat()}.{formato}"
+     » EXPLICACIÓN: Nombre: orientacion_AAAA-MM-DD.xlsx (o .json).
+
+ 341 |     ruta.write_bytes(datos)
+     » EXPLICACIÓN: Escribe el archivo.
+
+ 342 |     print(f"✔ Exportado: {ruta}")
+     » EXPLICACIÓN: Avisa dónde quedó.
+
+ 345 | @macro("conexion", "conexion  → comprueba la conexión con MongoDB y muestra el estado")
+     » EXPLICACIÓN: Registra el macro "conexion".
+
+ 346 | def conexion(db, args):
+     » EXPLICACIÓN: Macro de diagnóstico de conectividad.
+
+ 347 |     e = estado_conexion(db)
+     » EXPLICACIÓN: Hace el ping.
+
+ 348 |     print(f"Servidor: {uri_oculta(MONGO_URI)}  |  Base: {DB_NAME}")
+     » EXPLICACIÓN: Muestra la dirección (con contraseña oculta) y la base.
+
+ 349 |     if not e["conectado"]:
+ 350 |         print(f"✘ Sin conexión ({e['error']}).")
+ 351 |         return
+     » EXPLICACIÓN: Si no hay conexión, lo informa con el tipo de error y termina.
+
+ 352 |     print(f"✔ Conectado ({e['ms']} ms) | MongoDB {db.client.server_info()['version']}")
+     » EXPLICACIÓN: Si hay: tiempo de respuesta y versión de MongoDB.
+
+ 353 |     print(f"  alumnos: {db.alumnos.count_documents({})} | canalizaciones: "
+ 354 |           f"{db.canalizaciones.count_documents({})} | usuarios: {db.usuarios.count_documents({})}")
+     » EXPLICACIÓN: Cuántos alumnos, canalizaciones y usuarios hay guardados.
+
+ 357 | def recalcular_anteriores(db, controles):
+     » EXPLICACIÓN: Calcula "canalizaciones anteriores" de cada canalización.
+
+ 358 |     """Número de canalizaciones anteriores = cuántas hubo antes de cada una (por fecha)."""
+     » EXPLICACIÓN: Descripción: cuántas hubo antes de cada una, ordenadas por fecha.
+
+ 359 |     ops = []
+     » EXPLICACIÓN: Lista de actualizaciones.
+
+ 360 |     for c in controles:
+     » EXPLICACIÓN: Para cada alumno afectado...
+
+ 361 |         docs = list(db.canalizaciones.find({"numero_control": c}, {"_id": 1}).sort("fecha_atencion", ASCENDING))
+     » EXPLICACIÓN: ...trae sus canalizaciones ordenadas por fecha (solo el identificador
+       interno).
+
+ 362 |         for i, d in enumerate(docs):
+     » EXPLICACIÓN: enumerate da la posición i: la primera es 0, la segunda 1...
+
+ 363 |             ops.append(UpdateOne({"_id": d["_id"]}, {"$set": {"canalizaciones_anteriores": i}}))
+     » EXPLICACIÓN: Guarda i como número de canalizaciones anteriores (la 1ª tiene 0, la 2ª tiene
+       1).
+
+ 364 |     if ops:
+     » EXPLICACIÓN: Si hay algo que actualizar...
+
+ 365 |         db.canalizaciones.bulk_write(ops, ordered=False)
+ 366 | 
+ 367 | 
+ 368 | # --------------------------------------------------------------------------
+ 369 | # MACRO: registrar (captura con autocompletado)
+ 370 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: ...lo envía todo junto.
+
+ 371 | @macro("registrar", "registrar  → nueva canalización; escribe el nº de control y se autocompleta el resto")
+     » EXPLICACIÓN: Registra el macro "registrar".
+
+ 372 | def registrar(db, args):
+     » EXPLICACIÓN: Captura una canalización nueva en la consola.
+
+ 373 |     control = preguntar("Número de control", completer=ControlCompleter(db) if pt_prompt else None)
+     » EXPLICACIÓN: Pide el número de control, con sugerencias.
+
+ 374 |     if not control:
+ 375 |         return
+     » EXPLICACIÓN: Si no escribió nada, termina.
+
+ 376 |     alumno = db.alumnos.find_one({"numero_control": control}, {"_id": 0})
+     » EXPLICACIÓN: Busca al alumno; si no existe devuelve None.
+
+ 377 |     if alumno:
+     » EXPLICACIÓN: Si existe...
+
+ 378 |         print(f"→ Encontrado: {alumno.get('apellido_paterno','')} {alumno.get('apellido_materno','')} {alumno.get('nombre','')}")
+     » EXPLICACIÓN: ...muestra su nombre completo.
+
+ 379 |     else:
+     » EXPLICACIÓN: Si no existe...
+
+ 380 |         print("→ Alumno nuevo: captura todos los datos.")
+     » EXPLICACIÓN: ...avisa que se capturarán todos los datos.
+
+ 381 |         alumno = {"numero_control": control}
+     » EXPLICACIÓN: Crea un diccionario con solo el control.
+
+ 383 |     datos = {"numero_control": control}
+     » EXPLICACIÓN: Diccionario donde se irán juntando las respuestas.
+
+ 384 |     for campo in CAMPOS_ALUMNO[1:]:  # editables, con valor autocompletado como predeterminado
+     » EXPLICACIÓN: Recorre los campos del alumno (el [1:] omite el control, ya capturado).
+
+ 385 |         datos[campo] = preguntar(ETIQUETAS[campo], alumno.get(campo, ""))
+     » EXPLICACIÓN: Pregunta cada campo mostrando el valor guardado como propuesta (autocompletado
+       editable).
+
+ 386 |     datos["fecha_atencion"] = a_fecha_iso(preguntar(ETIQUETAS["fecha_atencion"], date.today().isoformat()))
+     » EXPLICACIÓN: Pregunta la fecha proponiendo hoy (date.today().isoformat()).
+
+ 387 |     for campo in CAMPOS_CANALIZACION[1:]:
+     » EXPLICACIÓN: Recorre quién reporta, motivo, medida y seguimiento.
+
+ 388 |         datos[campo] = preguntar(ETIQUETAS[campo])
+     » EXPLICACIÓN: Los pregunta sin propuesta.
+
+ 390 |     datos["canalizaciones_anteriores"] = db.canalizaciones.count_documents({"numero_control": control})
+     » EXPLICACIÓN: Cuenta cuántas canalizaciones ya tiene el alumno.
+
+ 391 |     db.alumnos.update_one({"numero_control": control},
+ 392 |                           {"$set": {k: datos[k] for k in CAMPOS_ALUMNO}}, upsert=True)
+     » EXPLICACIÓN: Guarda o actualiza al alumno (upsert=True lo crea si no existe).
+
+ 393 |     db.canalizaciones.insert_one(datos)
+     » EXPLICACIÓN: Inserta la canalización.
+
+ 394 |     print(f"✔ Canalización guardada (anteriores: {datos['canalizaciones_anteriores']}).")
+     » EXPLICACIÓN: Confirma.
+
+ 395 |     if preguntar("¿Generar PDF ahora? (s/n)", "s").lower().startswith("s"):
+     » EXPLICACIÓN: Pregunta si desea el PDF (por omisión "s"). startswith("s") acepta s/sí.
+
+ 396 |         ruta = generar_pdf([datos], f"canalizacion_{control}_{datos['fecha_atencion']}.pdf")
+     » EXPLICACIÓN: Genera el PDF de esa canalización.
+
+ 397 |         print(f"✔ PDF: {ruta}")
+ 398 | 
+ 399 | 
+ 400 | # --------------------------------------------------------------------------
+ 401 | # MACROS: buscar / filtrar
+ 402 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: Muestra la ruta.
+
+ 403 | def construir_filtro(args):
+     » EXPLICACIÓN: Convierte palabras como semestre=4 turno=matutino en una consulta de MongoDB.
+
+ 404 |     """Convierte  semestre=4 turno=matutino  en un filtro de Mongo (sin distinguir mayúsculas)."""
+     » EXPLICACIÓN: Descripción.
+
+ 405 |     filtro = {}
+     » EXPLICACIÓN: Consulta vacía.
+
+ 406 |     for a in args:
+     » EXPLICACIÓN: Recorre cada argumento.
+
+ 407 |         if "=" not in a:
+ 408 |             continue
+     » EXPLICACIÓN: Ignora lo que no tenga "=" (continue en la línea siguiente).
+
+ 409 |         k, v = a.split("=", 1)
+     » EXPLICACIÓN: Separa campo y valor.
+
+ 410 |         k = normalizar_columna(k)
+     » EXPLICACIÓN: Acepta "Semestre", "semestre", "Generación"...
+
+ 411 |         if k in ("desde", "hasta"):
+     » EXPLICACIÓN: Las fechas son un rango especial...
+
+ 412 |             filtro.setdefault("fecha_atencion", {})["$gte" if k == "desde" else "$lte"] = a_fecha_iso(v)
+     » EXPLICACIÓN: ...$gte = mayor o igual (desde), $lte = menor o igual (hasta).
+
+ 413 |         else:
+     » EXPLICACIÓN: Los demás campos...
+
+ 414 |             filtro[k] = {"$regex": f"^{re.escape(v)}$", "$options": "i"}
+     » EXPLICACIÓN: Coincidencia exacta sin importar mayúsculas ("$options": "i").
+
+ 415 |     return filtro
+     » EXPLICACIÓN: Devuelve la consulta.
+
+ 418 | def mostrar(docs, campos):
+     » EXPLICACIÓN: Imprime resultados como tabla en consola.
+
+ 419 |     docs = list(docs)
+     » EXPLICACIÓN: Convierte el resultado en lista.
+
+ 420 |     if not docs:
+ 421 |         print("(sin resultados)")
+ 422 |         return
+     » EXPLICACIÓN: Si está vacía, imprime "(sin resultados)" y termina.
+
+ 423 |     print(pd.DataFrame(docs)[campos].to_string(index=False))
+ 424 |     print(f"\n{len(docs)} resultado(s)")
+     » EXPLICACIÓN: Arma tabla con las columnas elegidas y la imprime sin números de fila; después
+       imprime el total.
+
+ 427 | @macro("buscar", "buscar <texto>  → busca alumno por nº de control (prefijo) o apellido")
+     » EXPLICACIÓN: Registra "buscar".
+
+ 428 | def buscar(db, args):
+ 429 |     if not args:
+ 430 |         print("Uso: buscar <texto>")
+ 431 |         return
+     » EXPLICACIÓN: Busca alumnos por prefijo de control o de apellido.
+
+ 432 |     t = re.escape(" ".join(args))
+     » EXPLICACIÓN: Une los argumentos en un texto y neutraliza símbolos especiales.
+
+ 433 |     cur = db.alumnos.find({"$or": [{"numero_control": {"$regex": "^" + t}},
+ 434 |                                    {"apellido_paterno": {"$regex": "^" + t, "$options": "i"}}]},
+ 435 |                           {"_id": 0}).limit(50)
+     » EXPLICACIÓN: "$or": cumple una condición u otra. Limita a 50 resultados.
+
+ 436 |     mostrar(cur, ["numero_control", "apellido_paterno", "apellido_materno", "nombre", "semestre", "grupo", "turno"])
+     » EXPLICACIÓN: Muestra la tabla.
+
+ 439 | @macro("filtrar", "filtrar campo=valor ... [desde=AAAA-MM-DD hasta=AAAA-MM-DD]  → filtra canalizaciones")
+     » EXPLICACIÓN: Registra "filtrar".
+
+ 440 | def filtrar(db, args):
+     » EXPLICACIÓN: Filtra canalizaciones.
+
+ 441 |     filtro = construir_filtro(args)
+     » EXPLICACIÓN: Arma la consulta.
+
+ 442 |     cur = db.canalizaciones.find(filtro, {"_id": 0}).sort("fecha_atencion", DESCENDING).limit(500)
+     » EXPLICACIÓN: Consulta ordenada de más reciente a más antigua, máximo 500.
+
+ 443 |     mostrar(cur, ["fecha_atencion", "numero_control", "apellido_paterno", "nombre", "semestre",
+ 444 |                   "grupo", "turno", "motivo", "canalizaciones_anteriores"])
+ 445 | 
+ 446 | 
+ 447 | # --------------------------------------------------------------------------
+ 448 | # PDF con plantilla
+ 449 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: Imprime con las columnas principales.
+
+ 450 | def generar_pdf(docs, nombre_archivo) -> Path:
+     » EXPLICACIÓN: Construye el PDF con la plantilla; una hoja por canalización. Recibe lista de
+       canalizaciones y nombre del archivo.
+
+ 451 |     """Una hoja por canalización, con la plantilla institucional."""
+     » EXPLICACIÓN: Descripción.
+
+ 452 |     DIR_PDF.mkdir(exist_ok=True)
+     » EXPLICACIÓN: Crea la carpeta reportes si no existe.
+
+ 453 |     ruta = DIR_PDF / nombre_archivo
+     » EXPLICACIÓN: Ruta completa del PDF.
+
+ 454 |     est = getSampleStyleSheet()
+     » EXPLICACIÓN: Estilos base de reportlab.
+
+ 455 |     titulo = ParagraphStyle("t", parent=est["Title"], fontSize=15, spaceAfter=2)
+     » EXPLICACIÓN: Estilo del nombre de la escuela (tamaño 15).
+
+ 456 |     sub = ParagraphStyle("s", parent=est["Normal"], alignment=1, fontSize=10, textColor=colors.grey)
+     » EXPLICACIÓN: Estilo de subtítulos: centrado, gris.
+
+ 457 |     cel = ParagraphStyle("c", parent=est["Normal"], fontSize=9.5, leading=12)
+     » EXPLICACIÓN: Estilo del texto dentro de las celdas.
+
+ 458 |     etq = ParagraphStyle("e", parent=cel, fontName="Helvetica-Bold")
+     » EXPLICACIÓN: Estilo de las etiquetas: igual al anterior pero en negritas.
+
+ 460 |     doc = SimpleDocTemplate(str(ruta), pagesize=letter, leftMargin=2 * cm, rightMargin=2 * cm,
+ 461 |                             topMargin=1.8 * cm, bottomMargin=1.8 * cm, title="Reporte de canalización")
+     » EXPLICACIÓN: Documento carta con márgenes de 2 cm y 1.8 cm.
+
+ 462 |     historia = []
+     » EXPLICACIÓN: Lista de elementos que irán al PDF, en orden ("historia" es el término de
+       reportlab).
+
+ 463 |     for i, d in enumerate(docs):
+     » EXPLICACIÓN: Una vuelta por canalización (una hoja cada una).
+
+ 464 |         historia += [Paragraph(ESCUELA, titulo),
+ 465 |                      Paragraph("Departamento de Orientación Educativa", sub),
+ 466 |                      Paragraph("<b>REPORTE DE CANALIZACIÓN</b>", ParagraphStyle("r", parent=sub, fontSize=12, textColor=colors.black, spaceBefore=6)),
+ 467 |                      Spacer(1, 14)]
+     » EXPLICACIÓN: Encabezado: escuela, departamento, título y espacio de 14 puntos.
+
+ 468 |         orden = ["fecha_atencion", "numero_control", "apellido_paterno", "apellido_materno", "nombre",
+ 469 |                  "generacion", "especialidad", "semestre", "grupo", "grado", "turno",
+ 470 |                  "persona_reporta", "nombre_padre_madre", "telefono"]
+     » EXPLICACIÓN: Orden de los 14 datos cortos que van en la tabla superior.
+
+ 471 |         filas = []
+     » EXPLICACIÓN: Filas de la tabla.
+
+ 472 |         # pares de campos cortos en dos columnas
+     » EXPLICACIÓN: Comentario: se ponen dos datos por fila.
+
+ 473 |         for j in range(0, len(orden), 2):
+     » EXPLICACIÓN: Avanza de dos en dos por la lista.
+
+ 474 |             par = orden[j:j + 2]
+     » EXPLICACIÓN: Toma el par actual.
+
+ 475 |             fila = []
+     » EXPLICACIÓN: Fila vacía.
+
+ 476 |             for k in par:
+     » EXPLICACIÓN: Para cada campo del par...
+
+ 477 |                 fila += [Paragraph(ETIQUETAS[k], etq), Paragraph(limpiar(d.get(k)) or "—", cel)]
+     » EXPLICACIÓN: ...agrega su etiqueta y su valor ("—" si está vacío).
+
+ 478 |             while len(fila) < 4:
+     » EXPLICACIÓN: Si el par quedó incompleto (cantidad impar)...
+
+ 479 |                 fila += ["", ""]
+     » EXPLICACIÓN: ...rellena con celdas vacías.
+
+ 480 |             filas.append(fila)
+     » EXPLICACIÓN: Agrega la fila.
+
+ 481 |         t = Table(filas, colWidths=[3.4 * cm, 5.1 * cm, 3.4 * cm, 5.1 * cm])
+     » EXPLICACIÓN: Crea la tabla con 4 columnas de anchos fijos.
+
+ 482 |         t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+ 483 |                                ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+ 484 |                                ("BACKGROUND", (2, 0), (2, -1), colors.whitesmoke),
+ 485 |                                ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+     » EXPLICACIÓN: Bordes grises, fondo gris claro en columnas de etiquetas, texto centrado
+       verticalmente.
+
+ 486 |         historia += [t, Spacer(1, 12)]
+     » EXPLICACIÓN: Agrega tabla y espacio.
+
+ 488 |         largos = ["motivo", "medida_modificacion_conducta", "seguimiento_documentos"]
+     » EXPLICACIÓN: Campos de texto largo.
+
+ 489 |         filas_l = [[Paragraph(ETIQUETAS[k], etq), Paragraph(limpiar(d.get(k)) or "—", cel)] for k in largos]
+     » EXPLICACIÓN: Una fila por campo largo: etiqueta y contenido.
+
+ 490 |         filas_l.append([Paragraph(ETIQUETAS["canalizaciones_anteriores"], etq),
+ 491 |                         Paragraph(str(d.get("canalizaciones_anteriores", 0)), cel)])
+     » EXPLICACIÓN: Agrega "Número de canalizaciones anteriores".
+
+ 492 |         tl = Table(filas_l, colWidths=[5.5 * cm, 11.5 * cm], rowHeights=[2.4 * cm, 2.4 * cm, 2.4 * cm, None])
+     » EXPLICACIÓN: Tabla de campos largos, cada uno con altura de 2.4 cm para escribir notas a
+       mano.
+
+ 493 |         tl.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+ 494 |                                 ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+ 495 |                                 ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+     » EXPLICACIÓN: Mismo estilo; texto arriba.
+
+ 496 |         historia += [tl, Spacer(1, 70)]
+     » EXPLICACIÓN: Agrega la tabla y un espacio grande antes de las firmas.
+
+ 498 |         firmas = Table([["______________________", "______________________", "______________________"],
+ 499 |                         ["Orientador(a)", "Alumno(a)", "Padre / madre / tutor"]], colWidths=[5.7 * cm] * 3)
+     » EXPLICACIÓN: Tabla de 3 columnas: líneas de firma y debajo Orientador(a), Alumno(a) y
+       Padre/madre/tutor.
+
+ 500 |         firmas.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("FONTSIZE", (0, 0), (-1, -1), 9)]))
+     » EXPLICACIÓN: Texto centrado, tamaño 9.
+
+ 501 |         historia.append(firmas)
+     » EXPLICACIÓN: Agrega las firmas.
+
+ 502 |         if i < len(docs) - 1:
+     » EXPLICACIÓN: Si no es la última canalización...
+
+ 503 |             historia.append(PageBreak())
+     » EXPLICACIÓN: ...inserta salto de página (así hay una hoja por canalización).
+
+ 504 |     doc.build(historia)
+     » EXPLICACIÓN: Dibuja y guarda el PDF.
+
+ 505 |     return ruta
+     » EXPLICACIÓN: Devuelve la ruta.
+
+ 508 | @macro("reporte", "reporte <nº control> [AAAA-MM-DD]  → PDF de la última (o de esa fecha) canalización")
+     » EXPLICACIÓN: Registra "reporte".
+
+ 509 | def reporte(db, args):
+ 510 |     if not args:
+ 511 |         print("Uso: reporte <numero_control> [fecha]")
+ 512 |         return
+     » EXPLICACIÓN: PDF de una canalización de un alumno.
+
+ 513 |     filtro = {"numero_control": args[0]}
+     » EXPLICACIÓN: Busca por el control dado.
+
+ 514 |     if len(args) > 1:
+     » EXPLICACIÓN: Si también dio una fecha...
+
+ 515 |         filtro["fecha_atencion"] = a_fecha_iso(args[1])
+     » EXPLICACIÓN: ...la agrega al filtro.
+
+ 516 |     d = db.canalizaciones.find_one(filtro, {"_id": 0}, sort=[("fecha_atencion", DESCENDING)])
+     » EXPLICACIÓN: Busca una; sort DESCENDING toma la más reciente.
+
+ 517 |     if not d:
+ 518 |         print("No hay canalizaciones con esos datos.")
+ 519 |         return
+     » EXPLICACIÓN: Si no hay, avisa y termina.
+
+ 520 |     print(f"✔ PDF: {generar_pdf([d], f'canalizacion_{d['numero_control']}_{d['fecha_atencion']}.pdf')}")
+     » EXPLICACIÓN: Genera el PDF y muestra su ruta.
+
+ 523 | @macro("lote", "lote campo=valor ...  → un solo PDF con todas las canalizaciones que cumplan el filtro")
+     » EXPLICACIÓN: Registra "lote".
+
+ 524 | def lote(db, args):
+     » EXPLICACIÓN: Un solo PDF con todas las canalizaciones que cumplan el filtro.
+
+ 525 |     docs = list(db.canalizaciones.find(construir_filtro(args), {"_id": 0}).sort(
+ 526 |         [("apellido_paterno", ASCENDING), ("fecha_atencion", ASCENDING)]))
+     » EXPLICACIÓN: Trae las filtradas ordenadas por apellido y fecha.
+
+ 527 |     if not docs:
+ 528 |         print("(sin resultados)")
+ 529 |         return
+     » EXPLICACIÓN: Si no hay, avisa y termina.
+
+ 530 |     print(f"✔ PDF con {len(docs)} hojas: {generar_pdf(docs, f'lote_{date.today().isoformat()}.pdf')}")
+     » EXPLICACIÓN: Genera el PDF y dice cuántas hojas tiene.
+
+ 533 | @macro("ayuda", "ayuda  → muestra los macros disponibles")
+     » EXPLICACIÓN: Registra "ayuda".
+
+ 534 | def ayuda(db, args):
+     » EXPLICACIÓN: Lista los macros disponibles.
+
+ 535 |     print("\nMacros disponibles (puedes encadenarlos con ';'):")
+     » EXPLICACIÓN: Encabezado.
+
+ 536 |     for n, (_, h) in MACROS.items():
+     » EXPLICACIÓN: Recorre el diccionario; "_" ignora la función y h es el texto de ayuda.
+
+ 537 |         print(f"  {h}")
+     » EXPLICACIÓN: Imprime la ayuda de cada macro (por eso cada macro nuevo aparece solo).
+
+ 538 |     print("  salir  → cerrar el programa\n")
+ 539 | 
+ 540 | 
+ 541 | # --------------------------------------------------------------------------
+ 542 | # EJECUCIÓN
+ 543 | # --------------------------------------------------------------------------
+     » EXPLICACIÓN: Agrega la línea de "salir".
+
+ 544 | def ejecutar(db, linea):
+     » EXPLICACIÓN: Ejecuta una línea de texto, que puede traer varios macros separados por ";".
+
+ 545 |     for cmd in [c.strip() for c in linea.split(";") if c.strip()]:
+     » EXPLICACIÓN: Parte la línea por ";" y recorre cada comando sin espacios sobrantes ni
+       vacíos.
+
+ 546 |         partes = shlex.split(cmd)
+     » EXPLICACIÓN: Separa palabras respetando comillas.
+
+ 547 |         nombre, args = partes[0].lower(), partes[1:]
+     » EXPLICACIÓN: Primera palabra = macro; el resto = argumentos.
+
+ 548 |         if nombre in ("salir", "exit"):
+     » EXPLICACIÓN: Si pide salir...
+
+ 549 |             return False
+     » EXPLICACIÓN: ...devuelve False: el ciclo principal se detiene.
+
+ 550 |         if nombre not in MACROS:
+ 551 |             print(f"Macro desconocida: {nombre}. Escribe 'ayuda'.")
+ 552 |             continue
+     » EXPLICACIÓN: Si el macro no existe, lo dice y pasa al siguiente (continue).
+
+ 553 |         try:
+     » EXPLICACIÓN: Protege la ejecución.
+
+ 554 |             MACROS[nombre][0](db, args)
+     » EXPLICACIÓN: Busca la función en el diccionario ([0]) y la ejecuta con la base y los
+       argumentos.
+
+ 555 |         except Exception as e:  # un error no cierra el programa
+     » EXPLICACIÓN: Si algo falla...
+
+ 556 |             print(f"Error en '{nombre}': {e}")
+     » EXPLICACIÓN: ...muestra el error sin cerrar el programa.
+
+ 557 |     return True
+     » EXPLICACIÓN: Indica que se puede seguir.
+
+ 560 | def main():
+     » EXPLICACIÓN: Punto de entrada del programa.
+
+ 561 |     try:
+     » EXPLICACIÓN: Intenta conectar.
+
+ 562 |         db = conectar()
+     » EXPLICACIÓN: Abre y prueba la conexión.
+
+ 563 |     except ConnectionError as e:
+     » EXPLICACIÓN: Si no se pudo...
+
+ 564 |         sys.exit(f"✘ {e}")
+     » EXPLICACIÓN: ...cierra mostrando el mensaje claro de conectar().
+
+ 565 |     if len(sys.argv) > 1:
+     » EXPLICACIÓN: Si se escribió algo después de "python gestor.py"...
+
+ 566 |         ejecutar(db, " ".join(f'"{a}"' if " " in a and ";" not in a else a for a in sys.argv[1:]))
+ 567 |         return
+     » EXPLICACIÓN: ...lo ejecuta como macros y termina (return en la línea siguiente).
+
+ 568 |     print("Gestor de Orientación — escribe 'ayuda' para ver los macros.")
+     » EXPLICACIÓN: Si no, modo interactivo: saluda.
+
+ 569 |     while True:
+     » EXPLICACIÓN: Ciclo infinito: pide macros hasta que se salga.
+
+ 570 |         try:
+     » EXPLICACIÓN: Protege contra Ctrl+C.
+
+ 571 |             if not ejecutar(db, input("macro> ")):
+ 572 |                 break
+     » EXPLICACIÓN: Lee la línea y la ejecuta; si devuelve False (salir) rompe el ciclo (break).
+
+ 573 |         except (EOFError, KeyboardInterrupt):
+ 574 |             break
+     » EXPLICACIÓN: Ctrl+C o Ctrl+D también salen limpiamente.
+
+ 577 | if __name__ == "__main__":
+     » EXPLICACIÓN: Verdadero solo si se ejecuta este archivo directamente (no si otro lo importa,
+       como hace app.py).
+
+ 578 |     main()
+     » EXPLICACIÓN: Arranca el programa.
+
+==========================================================================
+ARCHIVO 2: app.py (248 líneas)
+==========================================================================
+
+   1 | #!/usr/bin/env python3
+     » EXPLICACIÓN: Línea "shebang" (ver gestor.py).
+
+   2 | """Interfaz web (Flask) del Gestor de Orientación. Reutiliza gestor.py.
+   3 | Ejecutar:  python app.py   →  abrir http://localhost:5000
+   4 | """
+     » EXPLICACIÓN: Docstring: este archivo es la interfaz web (Flask). Reutiliza las funciones de
+       gestor.py. Se arranca con "python app.py" y se abre http://localhost:5000.
+
+   5 | import getpass
+     » EXPLICACIÓN: "getpass": pide una contraseña sin mostrarla al escribir.
+
+   6 | import io
+     » EXPLICACIÓN: "io": ofrece StringIO, un texto en memoria para capturar lo que imprime
+       importar().
+
+   7 | import os
+     » EXPLICACIÓN: Variables de entorno (HOST, PORT, SECRET_KEY).
+
+   8 | import re
+     » EXPLICACIÓN: Expresiones regulares.
+
+   9 | import secrets
+     » EXPLICACIÓN: Genera números aleatorios seguros para la llave secreta.
+
+  10 | import sys
+     » EXPLICACIÓN: Argumentos de consola y sys.exit.
+
+  11 | import tempfile
+     » EXPLICACIÓN: Carpetas temporales para los archivos subidos.
+
+  12 | import time
+     » EXPLICACIÓN: Hora actual, para el bloqueo por intentos fallidos.
+
+  13 | from functools import wraps
+     » EXPLICACIÓN: Ayuda a crear decoradores que conservan el nombre de la función.
+
+  14 | from io import BytesIO
+     » EXPLICACIÓN: Archivo en memoria (bytes) para enviar descargas sin escribir en disco.
+
+  15 | from contextlib import redirect_stdout
+     » EXPLICACIÓN: Permite redirigir lo que "imprime" una función hacia una variable.
+
+  16 | from datetime import date
+     » EXPLICACIÓN: Fecha de hoy.
+
+  17 | from pathlib import Path
+     » EXPLICACIÓN: Manejo de rutas.
+
+  19 | from bson import ObjectId
+     » EXPLICACIÓN: ObjectId: tipo del identificador interno de MongoDB (_id).
+
+  20 | from flask import (Flask, jsonify, redirect, render_template, request, send_file,
+  21 |                    session, url_for)
+     » EXPLICACIÓN: Flask es el servidor web: Flask (la aplicación), jsonify (responder en JSON),
+       redirect/url_for (redirigir), render_template (mostrar HTML), request (datos que llegan),
+       send_file (descargas) y session (sesión de cada usuario).
+
+  22 | from pymongo import DESCENDING
+     » EXPLICACIÓN: Orden descendente.
+
+  23 | from werkzeug.security import check_password_hash, generate_password_hash
+     » EXPLICACIÓN: Funciones para guardar contraseñas como "hash" (huella irreversible) y para
+       comprobarlas.
+
+  25 | from pymongo.errors import PyMongoError
+     » EXPLICACIÓN: Error general de MongoDB (para detectar "base caída").
+
+  27 | from gestor import (CAMPOS_ALUMNO, CAMPOS_CANALIZACION, a_fecha_iso, conectar,
+  28 |                     construir_filtro, estado_conexion, exportar_json, exportar_xlsx,
+  29 |                     generar_pdf, importar, limpiar)
+     » EXPLICACIÓN: Importa de gestor.py las piezas que reutiliza: campos, conexión, filtros,
+       exportación, PDF e importación.
+
+  31 | app = Flask(__name__)
+     » EXPLICACIÓN: Crea la aplicación web.
+
+  32 | app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
+     » EXPLICACIÓN: Límite de 20 MB por archivo subido.
+
+  33 | try:
+     » EXPLICACIÓN: Intenta conectar a la base al arrancar.
+
+  34 |     db = conectar()
+     » EXPLICACIÓN: Abre y prueba la conexión (misma función que gestor.py).
+
+  35 | except ConnectionError as e:
+     » EXPLICACIÓN: Si falla...
+
+  36 |     sys.exit(f"✘ {e}")
+     » EXPLICACIÓN: ...el servidor no arranca y muestra el mensaje con instrucciones.
+
+  37 | db.usuarios.create_index("usuario", unique=True)
+  38 | 
+  39 | # ---------------- Seguridad: sesiones y llave secreta ----------------
+     » EXPLICACIÓN: Índice único por nombre de usuario: no puede haber dos iguales.
+
+  40 | def llave_secreta():
+     » EXPLICACIÓN: Obtiene la llave con que se firman las sesiones (cookies). Sin ella, alguien
+       podría falsificar una sesión.
+
+  41 |     if os.getenv("SECRET_KEY"):
+     » EXPLICACIÓN: Si se definió en el .env...
+
+  42 |         return os.environ["SECRET_KEY"]
+     » EXPLICACIÓN: ...se usa esa.
+
+  43 |     f = Path(".secret_key")  # se crea una vez y se conserva entre reinicios
+     » EXPLICACIÓN: Si no, se usa un archivo local.
+
+  44 |     if not f.exists():
+     » EXPLICACIÓN: Si todavía no existe...
+
+  45 |         f.write_text(secrets.token_hex(32))
+     » EXPLICACIÓN: ...se crea con 64 caracteres aleatorios.
+
+  46 |         try:
+     » EXPLICACIÓN: Intenta restringir permisos.
+
+  47 |             f.chmod(0o600)
+     » EXPLICACIÓN: Solo el dueño puede leer/escribir el archivo (en Windows puede no aplicar).
+
+  48 |         except OSError:
+     » EXPLICACIÓN: Si el sistema no lo permite...
+
+  49 |             pass
+     » EXPLICACIÓN: ...no hace nada.
+
+  50 |     return f.read_text().strip()
+     » EXPLICACIÓN: Devuelve la llave guardada, así sobrevive a reinicios (las sesiones no se
+       pierden).
+
+  53 | app.secret_key = llave_secreta()
+     » EXPLICACIÓN: Asigna la llave a Flask.
+
+  54 | app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+  55 |                   PERMANENT_SESSION_LIFETIME=8 * 3600)  # la sesión dura 8 horas
+     » EXPLICACIÓN: Cookie "HttpOnly" (JavaScript no puede leerla), "SameSite=Lax" (no se envía
+       desde otros sitios: frena ataques CSRF) y sesión que dura 8 horas (8 × 3600 segundos).
+
+  56 | INTENTOS = {}  # ip -> (fallos, bloqueado_hasta)  — freno a contraseñas adivinadas
+     » EXPLICACIÓN: Memoria de intentos fallidos por dirección IP.
+
+  57 | MAX_FALLOS, BLOQUEO_SEG = 5, 300
+     » EXPLICACIÓN: Máximo 5 fallos; bloqueo de 300 segundos (5 minutos).
+
+  60 | def crear_usuario(usuario, clave, rol="orientador"):
+     » EXPLICACIÓN: Crea o actualiza un usuario. El rol por omisión es "orientador".
+
+  61 |     db.usuarios.update_one({"usuario": usuario.strip().lower()},
+  62 |                            {"$set": {"clave": generate_password_hash(clave), "rol": rol}}, upsert=True)
+     » EXPLICACIÓN: Guarda usuario (en minúsculas, sin espacios), contraseña convertida en hash y
+       rol. upsert=True: si ya existe, cambia su contraseña.
+
+  65 | def solo_admin(fn):
+  66 |     """Restringe una ruta al rol 'admin' (importar y exportar manejan todos los datos)."""
+     » EXPLICACIÓN: Decorador que restringe una ruta al rol "admin".
+
+  67 |     @wraps(fn)
+     » EXPLICACIÓN: Conserva el nombre de la función original.
+
+  68 |     def envoltura(*args, **kwargs):
+     » EXPLICACIÓN: Función que se ejecuta antes de la original.
+
+  69 |         if session.get("rol") != "admin":
+     » EXPLICACIÓN: Si el usuario conectado no es administrador...
+
+  70 |             return jsonify({"error": "Solo el administrador puede hacer esto."}), 403
+     » EXPLICACIÓN: ...responde con error 403 (prohibido).
+
+  71 |         return fn(*args, **kwargs)
+     » EXPLICACIÓN: Si es admin, ejecuta la función original.
+
+  72 |     return envoltura
+     » EXPLICACIÓN: Devuelve la función envuelta.
+
+  75 | @app.errorhandler(PyMongoError)
+     » EXPLICACIÓN: Captura cualquier error de MongoDB en cualquier ruta.
+
+  76 | def sin_base(e):
+     » EXPLICACIÓN: Se ejecuta cuando MongoDB falla a mitad de la operación.
+
+  77 |     return jsonify({"error": "Sin conexión con la base de datos. Revisa que MongoDB esté encendido."}), 503
+     » EXPLICACIÓN: Responde 503 ("servicio no disponible") con un mensaje claro; la página lo
+       muestra como aviso. Cuando MongoDB vuelva, pymongo reconecta solo.
+
+  80 | @app.get("/api/estado")
+     » EXPLICACIÓN: Ruta que consulta el indicador de conexión de la página cada 20 segundos.
+
+  81 | def estado():
+     » EXPLICACIÓN: Función de esa ruta.
+
+  82 |     return jsonify(estado_conexion(db))
+     » EXPLICACIÓN: Hace el ping y responde {conectado, ms}.
+
+  85 | @app.before_request
+     » EXPLICACIÓN: Se ejecuta ANTES de cada petición: es el "portero".
+
+  86 | def exigir_sesion():
+     » EXPLICACIÓN: Revisa si hay sesión iniciada.
+
+  87 |     if request.endpoint in ("login", "static") or "usuario" in session:
+  88 |         return None
+     » EXPLICACIÓN: Si la ruta es el login/archivos estáticos o ya hay usuario en la sesión, deja
+       pasar (return None).
+
+  89 |     if request.path.startswith(("/api/", "/pdf")):
+  90 |         return jsonify({"error": "Sesión vencida. Inicia sesión de nuevo."}), 401
+     » EXPLICACIÓN: Si no hay sesión y piden la API o un PDF...
+
+  91 |     return redirect(url_for("login"))
+     » EXPLICACIÓN: ...responde 401 (sin autorización). Si piden una página, la redirige al login.
+
+  94 | @app.route("/login", methods=["GET", "POST"])
+     » EXPLICACIÓN: Ruta del inicio de sesión; acepta GET (mostrar el formulario) y POST
+       (enviarlo).
+
+  95 | def login():
+     » EXPLICACIÓN: Función de la ruta.
+
+  96 |     error = ""
+     » EXPLICACIÓN: Mensaje de error vacío.
+
+  97 |     if request.method == "POST":
+     » EXPLICACIÓN: Si se envió el formulario...
+
+  98 |         ip = request.remote_addr
+     » EXPLICACIÓN: Dirección IP de quien intenta entrar.
+
+  99 |         fallos, hasta = INTENTOS.get(ip, (0, 0))
+     » EXPLICACIÓN: Recupera cuántos fallos lleva y hasta cuándo está bloqueado.
+
+ 100 |         if hasta > time.time():
+     » EXPLICACIÓN: Si el bloqueo sigue vigente...
+
+ 101 |             error = f"Demasiados intentos. Espera {int((hasta - time.time()) // 60) + 1} minuto(s)."
+     » EXPLICACIÓN: ...informa cuántos minutos esperar.
+
+ 102 |         else:
+     » EXPLICACIÓN: Si no...
+
+ 103 |             u = db.usuarios.find_one({"usuario": request.form.get("usuario", "").strip().lower()})
+     » EXPLICACIÓN: Busca el usuario (sin importar mayúsculas).
+
+ 104 |             if u and check_password_hash(u["clave"], request.form.get("clave", "")):
+     » EXPLICACIÓN: Si existe y la contraseña coincide con el hash...
+
+ 105 |                 INTENTOS.pop(ip, None)
+     » EXPLICACIÓN: ...borra sus fallos.
+
+ 106 |                 session.clear()
+     » EXPLICACIÓN: Limpia la sesión anterior.
+
+ 107 |                 session.permanent = True
+     » EXPLICACIÓN: Aplica la duración de 8 horas.
+
+ 108 |                 session["usuario"], session["rol"] = u["usuario"], u.get("rol", "orientador")
+     » EXPLICACIÓN: Guarda usuario y rol en la sesión.
+
+ 109 |                 return redirect(url_for("inicio"))
+     » EXPLICACIÓN: Lo manda a la página principal.
+
+ 110 |             fallos += 1
+     » EXPLICACIÓN: Si llegó aquí, falló: suma un fallo.
+
+ 111 |             INTENTOS[ip] = (fallos, time.time() + BLOQUEO_SEG if fallos >= MAX_FALLOS else 0)
+     » EXPLICACIÓN: Guarda el contador; al llegar a 5 fija la hora hasta la que queda bloqueado.
+
+ 112 |             error = "Usuario o contraseña incorrectos."
+     » EXPLICACIÓN: Mensaje genérico (no revela cuál de los dos falló).
+
+ 113 |     return render_template("login.html", error=error)
+     » EXPLICACIÓN: Muestra la página de login con el error si lo hay.
+
+ 116 | @app.get("/logout")
+     » EXPLICACIÓN: Ruta para cerrar sesión.
+
+ 117 | def logout():
+     » EXPLICACIÓN: Función.
+
+ 118 |     session.clear()
+     » EXPLICACIÓN: Borra la sesión.
+
+ 119 |     return redirect(url_for("login"))
+     » EXPLICACIÓN: Regresa al login.
+
+ 122 | def limpio(doc):
+     » EXPLICACIÓN: Convierte el documento para poder enviarlo como JSON.
+
+ 123 |     doc["_id"] = str(doc["_id"])
+     » EXPLICACIÓN: El _id de Mongo no es texto; se convierte a texto.
+
+ 124 |     return doc
+     » EXPLICACIÓN: Devuelve el documento.
+
+ 127 | @app.get("/")
+     » EXPLICACIÓN: Ruta de la página principal.
+
+ 128 | def inicio():
+     » EXPLICACIÓN: Función.
+
+ 129 |     return render_template("index.html", usuario=session["usuario"], rol=session["rol"])
+     » EXPLICACIÓN: Muestra index.html pasándole el usuario y su rol (la plantilla oculta
+       "Importar y exportar" a quien no es admin).
+
+ 132 | @app.get("/api/autocompletar")
+     » EXPLICACIÓN: Ruta que usa la página al escribir el número de control.
+
+ 133 | def autocompletar():
+     » EXPLICACIÓN: Función.
+
+ 134 |     q = request.args.get("q", "").strip()
+     » EXPLICACIÓN: Texto escrito (parámetro ?q=...), sin espacios sobrantes.
+
+ 135 |     if not q:
+     » EXPLICACIÓN: Si está vacío...
+
+ 136 |         return jsonify([])
+     » EXPLICACIÓN: ...responde lista vacía.
+
+ 137 |     cur = db.alumnos.find({"numero_control": {"$regex": "^" + re.escape(q)}},
+ 138 |                           {"_id": 0, "numero_control": 1, "nombre": 1,
+ 139 |                            "apellido_paterno": 1, "apellido_materno": 1}).limit(8)
+     » EXPLICACIÓN: Misma consulta por prefijo que en gestor.py, máximo 8 resultados.
+
+ 140 |     return jsonify(list(cur))
+     » EXPLICACIÓN: Responde la lista en JSON.
+
+ 143 | @app.get("/api/alumno/<control>")
+     » EXPLICACIÓN: Ruta que entrega los datos de un alumno; <control> es el número en la
+       dirección.
+
+ 144 | def alumno(control):
+     » EXPLICACIÓN: Función.
+
+ 145 |     a = db.alumnos.find_one({"numero_control": control}, {"_id": 0})
+     » EXPLICACIÓN: Busca al alumno.
+
+ 146 |     if not a:
+     » EXPLICACIÓN: Si no existe...
+
+ 147 |         return jsonify({"encontrado": False})
+     » EXPLICACIÓN: ...responde que no se encontró (alumno nuevo).
+
+ 148 |     a["canalizaciones_anteriores"] = db.canalizaciones.count_documents({"numero_control": control})
+     » EXPLICACIÓN: Agrega cuántas canalizaciones tiene.
+
+ 149 |     return jsonify({"encontrado": True, "alumno": a})
+     » EXPLICACIÓN: Responde los datos para autocompletar el formulario.
+
+ 152 | @app.post("/api/canalizaciones")
+     » EXPLICACIÓN: Ruta (POST) que guarda una canalización nueva.
+
+ 153 | def crear():
+     » EXPLICACIÓN: Función.
+
+ 154 |     d = request.get_json(force=True)
+     » EXPLICACIÓN: Lee los datos enviados por la página (JSON).
+
+ 155 |     control = limpiar(d.get("numero_control"))
+     » EXPLICACIÓN: Número de control limpio.
+
+ 156 |     if not control:
+     » EXPLICACIÓN: Si falta...
+
+ 157 |         return jsonify({"error": "Falta el número de control"}), 400
+     » EXPLICACIÓN: ...responde error 400.
+
+ 158 |     datos = {k: limpiar(d.get(k)) for k in CAMPOS_ALUMNO + CAMPOS_CANALIZACION}
+     » EXPLICACIÓN: Toma solo los campos válidos (ignora cualquier otro que alguien intente colar)
+       y los limpia.
+
+ 159 |     datos["numero_control"] = control
+     » EXPLICACIÓN: Fija el control.
+
+ 160 |     datos["fecha_atencion"] = a_fecha_iso(datos["fecha_atencion"]) or date.today().isoformat()
+     » EXPLICACIÓN: Normaliza la fecha o usa hoy si vino vacía.
+
+ 161 |     datos["canalizaciones_anteriores"] = db.canalizaciones.count_documents({"numero_control": control})
+     » EXPLICACIÓN: Cuenta las previas.
+
+ 162 |     datos["registrado_por"] = session["usuario"]  # quién capturó la canalización
+     » EXPLICACIÓN: Anota qué usuario la capturó (auditoría).
+
+ 163 |     db.alumnos.update_one({"numero_control": control},
+ 164 |                           {"$set": {k: datos[k] for k in CAMPOS_ALUMNO}}, upsert=True)
+     » EXPLICACIÓN: Crea o actualiza al alumno.
+
+ 165 |     res = db.canalizaciones.insert_one(datos)
+     » EXPLICACIÓN: Guarda la canalización.
+
+ 166 |     return jsonify({"id": str(res.inserted_id), "anteriores": datos["canalizaciones_anteriores"]})
+     » EXPLICACIÓN: Responde el identificador (para el botón de PDF) y el contador.
+
+ 169 | @app.get("/api/canalizaciones")
+     » EXPLICACIÓN: Ruta que lista canalizaciones con filtros.
+
+ 170 | def listar():
+     » EXPLICACIÓN: Función.
+
+ 171 |     filtro = construir_filtro([f"{k}={v}" for k, v in request.args.items() if v.strip()])
+     » EXPLICACIÓN: Convierte los filtros de la dirección (?semestre=4&turno=...) en consulta;
+       ignora los vacíos.
+
+ 172 |     docs = db.canalizaciones.find(filtro).sort("fecha_atencion", DESCENDING).limit(300)
+     » EXPLICACIÓN: Consulta ordenada por fecha descendente, máximo 300 resultados.
+
+ 173 |     return jsonify([limpio(d) for d in docs])
+     » EXPLICACIÓN: Responde la lista.
+
+ 176 | @app.post("/api/importar")
+     » EXPLICACIÓN: Ruta que recibe un archivo para importar.
+
+ 177 | @solo_admin
+     » EXPLICACIÓN: Solo el administrador.
+
+ 178 | def api_importar():
+     » EXPLICACIÓN: Función.
+
+ 179 |     f = request.files.get("archivo")
+     » EXPLICACIÓN: Archivo subido.
+
+ 180 |     if not f or not f.filename.lower().endswith((".xls", ".xlsx", ".json")):
+     » EXPLICACIÓN: Si no hay archivo o la extensión no es .xls, .xlsx o .json...
+
+ 181 |         return jsonify({"error": "Sube un archivo .xls, .xlsx o .json"}), 400
+     » EXPLICACIÓN: ...error 400.
+
+ 182 |     with tempfile.TemporaryDirectory() as tmp:
+     » EXPLICACIÓN: Carpeta temporal que se borra sola al terminar.
+
+ 183 |         ruta = Path(tmp) / Path(f.filename).name
+     » EXPLICACIÓN: Ruta del archivo dentro de ella (Path(...).name evita rutas maliciosas como
+       ../../).
+
+ 184 |         f.save(ruta)
+     » EXPLICACIÓN: Guarda el archivo subido.
+
+ 185 |         salida = io.StringIO()
+     » EXPLICACIÓN: Texto en memoria.
+
+ 186 |         with redirect_stdout(salida):
+     » EXPLICACIÓN: Mientras dure el bloque, lo que "imprima" importar() va a esa variable.
+
+ 187 |             importar(db, [str(ruta)])
+     » EXPLICACIÓN: Ejecuta la misma importación que la consola.
+
+ 188 |     return jsonify({"mensaje": salida.getvalue().strip()})
+     » EXPLICACIÓN: Devuelve el resumen o el error de importar() para mostrarlo en la página.
+
+ 191 | @app.get("/exportar/<formato>")
+     » EXPLICACIÓN: Ruta de descarga; <formato> es xlsx o json.
+
+ 192 | @solo_admin
+     » EXPLICACIÓN: Solo el administrador.
+
+ 193 | def descargar_exportacion(formato):
+     » EXPLICACIÓN: Función.
+
+ 194 |     filtro = construir_filtro([f"{k}={v}" for k, v in request.args.items() if v.strip()])
+     » EXPLICACIÓN: Filtros opcionales: permite exportar solo una parte.
+
+ 195 |     if formato == "xlsx":
+     » EXPLICACIÓN: Excel...
+
+ 196 |         datos, mime = exportar_xlsx(db, filtro), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+     » EXPLICACIÓN: ...genera los bytes y define el tipo de archivo (mime) que el navegador
+       reconoce.
+
+ 197 |     elif formato == "json":
+     » EXPLICACIÓN: JSON...
+
+ 198 |         datos, mime = exportar_json(db, filtro), "application/json"
+     » EXPLICACIÓN: ...genera los bytes JSON.
+
+ 199 |     else:
+     » EXPLICACIÓN: Otro...
+
+ 200 |         return jsonify({"error": "Formato no válido"}), 404
+     » EXPLICACIÓN: ...error 404.
+
+ 201 |     return send_file(BytesIO(datos), mimetype=mime, as_attachment=True,
+ 202 |                      download_name=f"orientacion_{date.today().isoformat()}.{formato}")
+     » EXPLICACIÓN: Envía la descarga desde memoria con el nombre orientacion_FECHA.extensión.
+
+ 205 | @app.get("/pdf/<id>")
+     » EXPLICACIÓN: Ruta que descarga el PDF de una canalización.
+
+ 206 | def pdf_uno(id):
+     » EXPLICACIÓN: Función.
+
+ 207 |     d = db.canalizaciones.find_one({"_id": ObjectId(id)}, {"_id": 0})
+     » EXPLICACIÓN: Busca por identificador (ObjectId convierte el texto en el tipo de Mongo).
+
+ 208 |     if not d:
+     » EXPLICACIÓN: Si no existe...
+
+ 209 |         return "No encontrada", 404
+     » EXPLICACIÓN: ...404.
+
+ 210 |     ruta = generar_pdf([d], f"canalizacion_{d['numero_control']}_{d['fecha_atencion']}.pdf")
+     » EXPLICACIÓN: Genera el PDF con la plantilla de gestor.py.
+
+ 211 |     return send_file(Path(ruta).resolve(), as_attachment=True)
+     » EXPLICACIÓN: Lo envía como descarga.
+
+ 214 | @app.get("/pdf-lote")
+     » EXPLICACIÓN: Ruta del PDF con varias canalizaciones.
+
+ 215 | def pdf_lote():
+     » EXPLICACIÓN: Función.
+
+ 216 |     filtro = construir_filtro([f"{k}={v}" for k, v in request.args.items() if v.strip()])
+     » EXPLICACIÓN: Filtros de la dirección.
+
+ 217 |     docs = list(db.canalizaciones.find(filtro, {"_id": 0}).sort("apellido_paterno", 1))
+     » EXPLICACIÓN: Consulta ordenada por apellido.
+
+ 218 |     if not docs:
+     » EXPLICACIÓN: Si no hay...
+
+ 219 |         return "Sin resultados", 404
+     » EXPLICACIÓN: ...404.
+
+ 220 |     ruta = generar_pdf(docs, f"lote_{date.today().isoformat()}.pdf")
+     » EXPLICACIÓN: Genera el PDF.
+
+ 221 |     return send_file(Path(ruta).resolve(), as_attachment=True)
+     » EXPLICACIÓN: Lo envía.
+
+ 224 | def primer_usuario():
+     » EXPLICACIÓN: Pide en consola crear el administrador la primera vez.
+
+ 225 |     """Si no hay usuarios, pide crear el administrador en la consola."""
+     » EXPLICACIÓN: Descripción.
+
+ 226 |     print("No hay usuarios. Crea el administrador.")
+     » EXPLICACIÓN: Aviso.
+
+ 227 |     while True:
+     » EXPLICACIÓN: Repite hasta que los datos sean válidos.
+
+ 228 |         u = input("Usuario: ").strip()
+     » EXPLICACIÓN: Pide el usuario.
+
+ 229 |         c = getpass.getpass("Contraseña (mínimo 8 caracteres): ")
+     » EXPLICACIÓN: Pide la contraseña sin mostrarla.
+
+ 230 |         if u and len(c) >= 8 and c == getpass.getpass("Repite la contraseña: "):
+     » EXPLICACIÓN: Valida: usuario no vacío, contraseña de 8+ caracteres y repetida igual.
+
+ 231 |             crear_usuario(u, c, "admin")
+     » EXPLICACIÓN: Lo crea como administrador...
+
+ 232 |             return
+     » EXPLICACIÓN: ...y sale.
+
+ 233 |         print("Datos inválidos o contraseñas distintas. Intenta de nuevo.\n")
+     » EXPLICACIÓN: Si no, avisa y repite.
+
+ 236 | if __name__ == "__main__":
+     » EXPLICACIÓN: Solo se ejecuta al lanzar "python app.py".
+
+ 237 |     if len(sys.argv) > 1 and sys.argv[1] == "crear-usuario":  # python app.py crear-usuario
+     » EXPLICACIÓN: Si se escribió "python app.py crear-usuario"...
+
+ 238 |         u = input("Usuario: ").strip()
+     » EXPLICACIÓN: Pide el usuario.
+
+ 239 |         c = getpass.getpass("Contraseña (mínimo 8 caracteres): ")
+     » EXPLICACIÓN: Pide la contraseña.
+
+ 240 |         if not u or len(c) < 8:
+     » EXPLICACIÓN: Valida.
+
+ 241 |             sys.exit("Usuario vacío o contraseña demasiado corta.")
+     » EXPLICACIÓN: Si no es válido, termina con mensaje.
+
+ 242 |         crear_usuario(u, c, input("Rol (admin/orientador) [orientador]: ").strip() or "orientador")
+     » EXPLICACIÓN: Pide el rol (por omisión orientador) y lo crea.
+
+ 243 |         sys.exit("Usuario guardado.")
+     » EXPLICACIÓN: Confirma y termina.
+
+ 244 |     if db.usuarios.count_documents({}) == 0:
+     » EXPLICACIÓN: Si no hay ningún usuario...
+
+ 245 |         primer_usuario()
+     » EXPLICACIÓN: ...obliga a crear el primero.
+
+ 246 |     # HOST=0.0.0.0 para que otras computadoras de la red entren; por defecto solo esta
+     » EXPLICACIÓN: Comentario: 0.0.0.0 abre el servicio a la red.
+
+ 247 |     app.run(host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "5000")), debug=False)
+     » EXPLICACIÓN: Inicia el servidor web con HOST y PORT del .env (por omisión 127.0.0.1:5000,
+       solo esta computadora). debug=False: sin modo de desarrollo, más seguro.
